@@ -10,6 +10,10 @@ import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
 import { log } from '../../utils/logger';
 import {
+  isTransportError,
+  transportSessionErrorReason,
+} from '../../utils/session-error';
+import {
   isFailoverError,
   isInlineFailoverError,
 } from '../foreground-fallback/index';
@@ -182,6 +186,41 @@ function observeSessionEvent(
   };
 }
 
+/**
+ * Events that prove a child session is still producing output.
+ *
+ * `message.part.delta` is the important one: during a long streamed reply it
+ * is the ONLY event a healthy lane emits, so a heartbeat without it would flag
+ * every slow-but-working lane as frozen (Gate-2 M1).
+ */
+const ACTIVITY_EVENT_TYPES = new Set([
+  'message.part.delta',
+  'message.part.updated',
+  'message.updated',
+]);
+
+/**
+ * Session id carried by an activity event, across the three shapes OpenCode
+ * uses: `properties.sessionID` (delta), `properties.part.sessionID`
+ * (part.updated) and `properties.info.sessionID` (message.updated).
+ */
+function activityEventSessionID(input: {
+  event: { properties?: Record<string, unknown> };
+}): string | undefined {
+  const properties = input.event.properties;
+  if (!properties) return undefined;
+  const direct = properties.sessionID;
+  if (typeof direct === 'string' && direct) return direct;
+  const part = isRecord(properties.part) ? properties.part : undefined;
+  if (typeof part?.sessionID === 'string' && part.sessionID) {
+    return part.sessionID;
+  }
+  const info = isRecord(properties.info) ? properties.info : undefined;
+  return typeof info?.sessionID === 'string' && info.sessionID
+    ? info.sessionID
+    : undefined;
+}
+
 function isCurrentSessionObservation(
   backgroundJobBoard: BackgroundJobStore,
   observation: SessionEventObservation,
@@ -297,6 +336,20 @@ export async function handleEvent(
   },
 ): Promise<void> {
   deps.inputWaits.trackInputWait(input.event);
+
+  // Heartbeat first, and before any early return: the activity clock backing
+  // silence detection has to see event types this router otherwise ignores
+  // (`message.part.delta`, `message.updated`) as well as the one it consumes
+  // and returns from below. One board lookup; unknown sessions no-op.
+  if (ACTIVITY_EVENT_TYPES.has(input.event.type)) {
+    const activeSessionID = activityEventSessionID(input);
+    if (activeSessionID) {
+      deps.backgroundJobBoard.recordActivity(
+        activeSessionID,
+        eventActivityAt(input, deps.options.now?.() ?? Date.now()),
+      );
+    }
+  }
 
   if (input.event.type === 'message.part.updated') {
     deps.observeSyntheticTerminalPart?.(input.event.properties?.part);
@@ -571,6 +624,25 @@ export async function handleEvent(
         ) {
           return;
         }
+        // A broken wire is not a failed task. The child's stream died; the
+        // work it was doing has no known outcome, and the session may still
+        // be alive on the host. Recording terminal `error` here would tell
+        // the orchestrator a failure it would act on, so surface recoverable
+        // uncertainty instead and let liveness reconciliation (plus silence
+        // detection) settle what actually happened.
+        if (isTransportError(props?.error)) {
+          const uncertain = deps.backgroundJobBoard.markStatusUncertain(
+            sessionId,
+            transportSessionErrorReason(props?.error),
+            observation?.generation,
+          );
+          log('[task-session-manager] child transport error kept recoverable', {
+            sessionID: sessionId,
+            alias: uncertain?.alias,
+            state: uncertain?.state,
+          });
+          return;
+        }
         const updated = deps.backgroundJobBoard.updateStatus({
           taskID: sessionId,
           state: 'error',
@@ -615,6 +687,12 @@ export async function handleEvent(
       !isCurrentSessionObservation(deps.backgroundJobBoard, observation)
     ) {
       return;
+    }
+    // A busy EVENT (unlike a busy poll) is a transition the host only emits
+    // when the session starts doing something, so it both seeds and refreshes
+    // the activity clock.
+    if (sessionId) {
+      deps.backgroundJobBoard.recordActivity(sessionId, observedAt);
     }
     if (sessionId) deps.idleSessionTokens.invalidate(sessionId);
     // Live busy cancels a pending child idle-reconcile — the session

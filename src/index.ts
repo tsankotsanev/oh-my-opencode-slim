@@ -482,6 +482,8 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       maxRetainedSnapshots: runtime.backgroundJobs.maxRetainedSnapshots,
       readContextMinLines: runtime.backgroundJobs.readContextMinLines,
       readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
+      silenceDetection: runtime.backgroundJobs.silenceDetection,
+      staleAfterMs: runtime.backgroundJobs.staleAfterMs,
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
       backgroundTaskConcurrency,

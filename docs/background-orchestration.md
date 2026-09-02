@@ -479,6 +479,73 @@ uncertain`; they never prove that a job stopped or completed and do not confirm
 a pending stop. Each observation is generation-aware, so a delayed response
 cannot modify a relaunched task.
 
+### Silence Detection
+
+`busy` proves that OpenCode still considers a session mid-turn. It does not
+prove that anything is happening. When a child's provider stream hangs — a
+dropped connection is the common cause — the session stays `busy` forever
+while emitting nothing, and no lifecycle event is ever produced for it. Left
+alone, the reconciliation above would keep confirming that lane as live and the
+orchestrator would wait indefinitely.
+
+Silence detection closes that gap as an extension of the same 5s cycle: no
+second poller, no new board state. Every message/part event on a tracked child
+(`message.part.delta`, `message.part.updated`, `message.updated`, and a
+`session.status busy` transition) refreshes that lane's activity clock. When the
+reconciliation cycle then reads `busy` for a lane whose clock has not moved in
+longer than `backgroundJobs.staleAfterMs` (default 5 minutes), the lane gets one
+bounded `session.messages` probe and the verdict is recorded as
+`running, status uncertain` with the reason `no activity for Ns while busy`.
+
+The probe also yields a `Last seen` line on the board — an excerpt of the
+lane's most recent assistant text plus its last tool call and message count —
+so the parent can see what the lane was doing when it went quiet instead of
+guessing from file diffs. That line contains no age or timestamp: the board is
+rendered into the prompt, and a wall-clock value there would change the bytes
+on every injection and silently defeat the provider prompt cache.
+
+Three kinds of lane are silent by design and are never flagged:
+
+- **Executing a tool.** Nothing at all is emitted between a tool part's
+  `running` and `completed` updates, so a long `bash` or nested subagent call
+  is byte-identical to a freeze. Any unfinished tool part in the last assistant
+  message exempts the lane, subject only to an internal 30-minute backstop.
+- **Retrying a provider call.** `retry` is a healthy, self-resolving state; the
+  lane genuinely has nothing to say until the retry lands, and the silence
+  clock restarts when it does.
+- **Awaiting a permission or question answer.** The lane is blocked on a human,
+  not hung.
+
+Recovery is never inferred from a `busy` reading, because for a silent lane
+that reading *is* the freeze signature — only real output clears the flag,
+along with its reason and captured excerpt. While the flag stands its reason
+text is frozen at the transition rather than recounting the seconds each cycle,
+and each lane is re-probed at most once per `staleAfterMs`. A flagged lane is
+not terminal and is never reusable; it is a statement that the outcome is
+unknown, which is exactly what a hung stream leaves behind.
+
+A child `session.error` carrying a transport fault (`ECONNRESET`, `ENOTFOUND`,
+`ETIMEDOUT`, `EAI_AGAIN`, `ECONNREFUSED`, or a bare `fetch failed` /
+`socket hang up` / timeout message) is classified the same way. The wire broke;
+the task did not fail. Recording it as terminal `error` would report a failure
+the orchestrator acts on, so it becomes recoverable `status uncertain` instead.
+Persistent auth/model errors (401/410) keep their existing foreground-fallback
+deferral.
+
+Both behaviours are configurable:
+
+```jsonc
+{
+  "backgroundJobs": {
+    "silenceDetection": true, // default; false disables probing entirely
+    "staleAfterMs": 300000 // default 5 minutes, minimum 10s
+  }
+}
+```
+
+With `silenceDetection: false` no lane is ever probed or flagged for silence,
+and the liveness reconciliation above behaves exactly as it did before.
+
 ### Background Task Concurrency
 
 `backgroundJobs.concurrency` (disabled by default, see

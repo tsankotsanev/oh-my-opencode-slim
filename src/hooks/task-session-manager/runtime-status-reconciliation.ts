@@ -6,6 +6,10 @@ import {
 } from '../../utils';
 import { log } from '../../utils/logger';
 import {
+  createSilenceMonitor,
+  type LaneMessagesProbe,
+} from './silence-detection';
+import {
   observeNonBusyRuntime,
   STOP_CONFIRMATION_GRACE_MS,
 } from './stop-confirmation';
@@ -18,6 +22,16 @@ export function createRuntimeStatusReconciler(options: {
   delayMs?: number;
   statusTimeoutMs?: number;
   stopConfirmationGraceMs?: number;
+  /** Silence detection (`backgroundJobs.silenceDetection`). Default on. */
+  silenceDetection?: boolean;
+  /** `backgroundJobs.staleAfterMs`. */
+  staleAfterMs?: number;
+  /** Permission/HITL seam: such lanes are silent by design. */
+  hasInputWait?: (sessionID: string) => boolean;
+  /** Test seams for silence detection. */
+  silenceNow?: () => number;
+  silenceProbe?: (sessionID: string) => Promise<LaneMessagesProbe>;
+  silenceToolStaleAfterMs?: number;
   taskContextTracker: {
     pendingManagedTaskIds: Set<string>;
     contextFilesForPrompt(taskId: string): ContextFile[];
@@ -25,6 +39,18 @@ export function createRuntimeStatusReconciler(options: {
   };
 }) {
   const delayMs = options.delayMs ?? RUNTIME_STATUS_RECONCILE_DELAY_MS;
+  // Extension of this same cycle, not a second poller: it reuses the one
+  // status map fetched below and only ever adds a bounded per-lane probe.
+  const silenceMonitor = createSilenceMonitor({
+    backgroundJobBoard: options.backgroundJobBoard,
+    input: options.input,
+    enabled: options.silenceDetection ?? true,
+    staleAfterMs: options.staleAfterMs,
+    toolStaleAfterMs: options.silenceToolStaleAfterMs,
+    hasInputWait: options.hasInputWait,
+    now: options.silenceNow,
+    probe: options.silenceProbe,
+  });
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   let activeReconcile: Promise<void> | undefined;
@@ -54,6 +80,7 @@ export function createRuntimeStatusReconciler(options: {
     const running = options.backgroundJobBoard
       .list()
       .filter((job) => job.state === 'running');
+    silenceMonitor.prune(new Set(running.map((job) => job.taskID)));
     if (running.length === 0) return;
 
     const requestStartedAt = Date.now();
@@ -95,6 +122,11 @@ export function createRuntimeStatusReconciler(options: {
           observedAt,
           job.generation,
         );
+        // `busy` is upstream's proof of life; it is also the exact signature of
+        // a hung stream. Judge the same reading against the lane's activity
+        // clock before moving on.
+        await silenceMonitor.observe(current, status);
+        if (disposed) return;
         continue;
       }
       if (

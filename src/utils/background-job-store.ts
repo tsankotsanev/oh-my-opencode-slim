@@ -5,6 +5,7 @@ import type {
   BackgroundJobRecord,
   BackgroundJobStatusInput,
   ContextFile,
+  LaneProgress,
   WallClockTimeoutClaimInput,
   WallClockTimeoutFinalizeInput,
 } from './background-job-board';
@@ -172,6 +173,31 @@ export interface BackgroundJobStore {
     lastStatusError: string,
     expectedGeneration?: number,
     now?: number,
+  ): BackgroundJobRecord | undefined;
+  /**
+   * Heartbeat from observed child output. Also releases a silence flag: real
+   * output is proof of life, whereas a `busy` status is not.
+   */
+  recordActivity(
+    taskID: string,
+    now?: number,
+    expectedGeneration?: number,
+  ): BackgroundJobRecord | undefined;
+  /** Flag a running lane as busy-but-silent; the reason is frozen. */
+  markSilenceDetected(
+    taskID: string,
+    reason: string,
+    options?: {
+      progress?: LaneProgress;
+      now?: number;
+      expectedGeneration?: number;
+    },
+  ): BackgroundJobRecord | undefined;
+  /** Store partial work captured by a probe. */
+  recordProgress(
+    taskID: string,
+    progress: LaneProgress,
+    expectedGeneration?: number,
   ): BackgroundJobRecord | undefined;
   /**
    * Acknowledge the terminal notification delivered to the parent session.

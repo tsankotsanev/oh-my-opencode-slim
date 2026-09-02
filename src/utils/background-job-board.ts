@@ -50,6 +50,21 @@ export interface BackgroundJobPromptMetadata {
 
 export type BackgroundJobState = TaskOutputState | 'stopped' | 'reconciled';
 
+/**
+ * Partial work observed on a lane, captured from one `session.messages` probe.
+ *
+ * Lets the parent see what a silent lane was doing instead of guessing from
+ * file diffs. `capturedAt` is bookkeeping only: it rate-limits re-probing and
+ * is deliberately never rendered, so the board stays byte-stable over time.
+ */
+export interface LaneProgress {
+  /** First ~300 chars of the most recent assistant text part. */
+  text?: string;
+  lastTool?: { name: string; status: string };
+  messageCount: number;
+  capturedAt: number;
+}
+
 export interface BackgroundJobRecord {
   taskID: string;
   parentSessionID: string;
@@ -76,6 +91,31 @@ export interface BackgroundJobRecord {
   deadlineExceededAt?: number;
   updatedAt: number;
   lastLiveBusyAt?: number;
+  /**
+   * Last observed child OUTPUT (message/part events).
+   *
+   * Deliberately distinct from {@link lastLiveBusyAt}: a `busy` status merely
+   * repeats "still nominally mid-turn", which for a hung provider stream is
+   * the freeze signature itself, not evidence of progress.
+   */
+  lastActivityAt?: number;
+  /**
+   * Set when silence detection flagged this lane as busy-but-silent.
+   *
+   * Its presence is what makes the flag survive the liveness poller's
+   * `busy` observations; real activity (`recordActivity`) clears it.
+   */
+  silenceDetectedAt?: number;
+  /**
+   * Reason text frozen at the silence transition.
+   *
+   * Never rewritten while the lane stays silent: recomputing the seconds count
+   * every cycle would churn the rendered board bytes (and bust the prompt
+   * cache) for a lane whose state has not actually changed.
+   */
+  silenceReason?: string;
+  /** Partial work captured by the most recent silence probe. */
+  lastProgress?: LaneProgress;
   /** First non-busy runtime observation for the current stop-confirmation grace. */
   stopConfirmationStartedAt?: number;
   completedAt?: number;
@@ -288,6 +328,10 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         runStartedAt: now,
         deadlineExceededAt: undefined,
         lastLiveBusyAt: now,
+        lastActivityAt: undefined,
+        silenceDetectedAt: undefined,
+        silenceReason: undefined,
+        lastProgress: undefined,
         stopConfirmationStartedAt: undefined,
         lastUsedAt: now,
         updatedAt: now,
@@ -394,6 +438,9 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         input.state === 'running'
           ? existing.stopConfirmationStartedAt
           : undefined,
+      // A terminal result answers the question the silence flag was asking.
+      silenceDetectedAt: terminal ? undefined : existing.silenceDetectedAt,
+      silenceReason: terminal ? undefined : existing.silenceReason,
     };
 
     if (input.state === 'completed') {
@@ -474,6 +521,12 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       return updated;
     }
 
+    // A live `busy` observation normally resolves every kind of uncertainty.
+    // Silence detection is the one exception: its whole claim is that this
+    // session reports busy while producing nothing, so letting the poller's
+    // own busy reading clear the flag would erase it every 5 seconds. Only
+    // real activity (`recordActivity`) or a terminal result may clear it.
+    const silent = existing.silenceDetectedAt !== undefined;
     const updated: BackgroundJobRecord = {
       ...existing,
       state: 'running',
@@ -483,17 +536,129 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       timedOut: false,
       recoverableAfterLiveBusy:
         existing.recoverableAfterLiveBusy || existing.timedOut,
-      statusUncertain: false,
+      statusUncertain: silent,
       terminalUnreconciled: false,
       completedAt:
         existing.state === 'stopped' ? undefined : existing.completedAt,
       resultSummary:
         existing.state === 'stopped' ? undefined : existing.resultSummary,
-      lastStatusError: undefined,
+      lastStatusError: silent ? existing.silenceReason : undefined,
       terminalState:
         existing.state === 'stopped' ? undefined : existing.terminalState,
     };
 
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /**
+   * Record observed child output as the lane's activity heartbeat.
+   *
+   * Called from the event router for message/part events on known child
+   * sessions. Output is proof of life, so it also releases a silence flag —
+   * unlike a `busy` status, which proves nothing for a hung stream.
+   */
+  recordActivity(
+    taskID: string,
+    now = Date.now(),
+    expectedGeneration?: number,
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (existing?.state !== 'running') return existing;
+    if (
+      expectedGeneration !== undefined &&
+      existing.generation !== expectedGeneration
+    ) {
+      return existing;
+    }
+
+    const lastActivityAt = Math.max(existing.lastActivityAt ?? 0, now);
+    if (existing.silenceDetectedAt === undefined) {
+      if (lastActivityAt === existing.lastActivityAt) return existing;
+      // Heartbeat only: no state transition, so nothing else on the record
+      // (and nothing rendered) changes.
+      const beat: BackgroundJobRecord = { ...existing, lastActivityAt };
+      this.jobs.set(taskID, beat);
+      return beat;
+    }
+
+    // The lane came back. Drop the flag, its frozen reason and the stale
+    // progress excerpt captured while it was quiet.
+    const revived: BackgroundJobRecord = {
+      ...existing,
+      lastActivityAt,
+      silenceDetectedAt: undefined,
+      silenceReason: undefined,
+      lastProgress: undefined,
+      statusUncertain: false,
+      lastStatusError: undefined,
+      updatedAt: now,
+    };
+    this.jobs.set(taskID, revived);
+    return revived;
+  }
+
+  /**
+   * Flag a running lane as busy-but-silent past the staleness threshold.
+   *
+   * Modelled as `statusUncertain` plus a frozen reason rather than a new board
+   * state: the lane may still be alive, and nothing here proves a terminal
+   * outcome. Re-marking an already-silent lane refreshes the captured progress
+   * but never rewrites the reason.
+   */
+  markSilenceDetected(
+    taskID: string,
+    reason: string,
+    options: {
+      progress?: LaneProgress;
+      now?: number;
+      expectedGeneration?: number;
+    } = {},
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (existing?.state !== 'running') return existing;
+    if (
+      options.expectedGeneration !== undefined &&
+      existing.generation !== options.expectedGeneration
+    ) {
+      return existing;
+    }
+    if (existing.deadlineExceededAt !== undefined) return existing;
+
+    const now = options.now ?? Date.now();
+    const frozenReason = existing.silenceReason ?? reason;
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      statusUncertain: true,
+      lastStatusError: frozenReason,
+      silenceDetectedAt: existing.silenceDetectedAt ?? now,
+      silenceReason: frozenReason,
+      lastProgress: options.progress ?? existing.lastProgress,
+      updatedAt:
+        existing.silenceDetectedAt === undefined ? now : existing.updatedAt,
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /** Store partial work from a probe without asserting anything about state. */
+  recordProgress(
+    taskID: string,
+    progress: LaneProgress,
+    expectedGeneration?: number,
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (!existing) return undefined;
+    if (
+      expectedGeneration !== undefined &&
+      existing.generation !== expectedGeneration
+    ) {
+      return existing;
+    }
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      lastProgress: progress,
+    };
     this.jobs.set(taskID, updated);
     return updated;
   }
@@ -537,6 +702,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       completedAt: existing.completedAt ?? now,
       resultSummary,
       lastStatusError: undefined,
+      silenceDetectedAt: undefined,
+      silenceReason: undefined,
       stopConfirmationStartedAt: undefined,
     };
     this.jobs.set(taskID, updated);
@@ -700,6 +867,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       terminalState: 'cancelled',
       resultSummary: summary,
       lastStatusError: undefined,
+      silenceDetectedAt: undefined,
+      silenceReason: undefined,
       stopConfirmationStartedAt: undefined,
     };
 
@@ -902,6 +1071,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       timeoutCount: (existing.timeoutCount ?? 0) + 1,
       lastErrorAt: now,
       totalErrors: (existing.totalErrors ?? 0) + 1,
+      silenceDetectedAt: undefined,
+      silenceReason: undefined,
       stopConfirmationStartedAt: undefined,
     };
     this.jobs.set(input.taskID, updated);
@@ -1289,7 +1460,39 @@ function formatJob(job: BackgroundJobRecord): string {
     lines.push(`  Status: ${promptSafe(job.lastStatusError)}`);
   }
 
+  const lastSeen = formatLastSeen(job);
+  if (lastSeen) lines.push(lastSeen);
+
   return lines.join('\n');
+}
+
+/**
+ * What a flagged-silent lane was last doing.
+ *
+ * Rendered from the stored probe only — no wall-clock age, no `capturedAt`,
+ * nothing derived from "now". Two renders of an unchanged lane must be
+ * byte-identical or every board injection busts the provider prompt cache.
+ */
+function formatLastSeen(job: BackgroundJobRecord): string | undefined {
+  if (job.state !== 'running' || !job.statusUncertain) return undefined;
+  const progress = job.lastProgress;
+  if (!progress) return undefined;
+
+  const detail = [
+    ...(progress.lastTool
+      ? [
+          `last tool: ${promptSafe(progress.lastTool.name)} ${promptSafe(
+            progress.lastTool.status,
+          )}`,
+        ]
+      : []),
+    `${progress.messageCount} msg${progress.messageCount === 1 ? '' : 's'}`,
+  ].join(', ');
+  const text = progress.text
+    ? promptSafe(progress.text)
+    : 'no assistant output yet';
+
+  return `  Last seen: ${text} (${detail})`;
 }
 
 function singleLine(value: string): string {

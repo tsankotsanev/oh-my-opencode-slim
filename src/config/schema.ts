@@ -268,6 +268,21 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'Grace period after a wall-clock deadline while OpenCode confirms the child terminal state (1,000–60,000ms).',
     ),
+  silenceDetection: z
+    .boolean()
+    .default(true)
+    .describe(
+      'When true, a background child session that OpenCode still reports as busy while emitting no output for longer than staleAfterMs is flagged on the board as status uncertain, with an excerpt of what it was last doing. Detects hung provider streams (e.g. a dropped connection) that no lifecycle event ever reports. Default enabled.',
+    ),
+  staleAfterMs: z
+    .number()
+    .int()
+    .min(10_000)
+    .max(2_147_483_647)
+    .default(300_000)
+    .describe(
+      'Silence budget for a busy background child session before it is flagged as status uncertain (10,000–2,147,483,647ms). Default 300,000 (5 minutes). Lanes executing a tool, retrying a provider call, or awaiting a permission answer are exempt.',
+    ),
   concurrency: BackgroundTaskConcurrencyConfigSchema,
   waitForUserGuard: z
     .boolean()

@@ -71,6 +71,10 @@ const ALLOWLIST = new Map<string, string>([
     'Date.now() establishes in-memory request/observation ordering for generation-safe status reconciliation; board timestamps are never formatted into prompt content.',
   ],
   [
+    'hooks/task-session-manager/silence-detection.ts',
+    'Date.now() is the default silence clock: it decides WHETHER a lane is flagged and stamps LaneProgress.capturedAt for probe rate-limiting. Neither value is rendered — background-job-board.ts formats only the frozen reason text and the probe excerpt (text/lastTool/messageCount), never capturedAt or any age, so two renders of an unchanged lane are byte-identical.',
+  ],
+  [
     'hooks/image-hook.ts',
     'Date.now() throttles temp-image cleanup; extracted image paths are deterministic per part id.',
   ],

@@ -198,6 +198,10 @@ export function createTaskSessionManagerHook(
     idleReconcileDelayMs?: number;
     /** Test seam only; production uses the runtime reconciliation delay. */
     runtimeStatusReconcileDelayMs?: number;
+    /** `backgroundJobs.silenceDetection`; default on. */
+    silenceDetection?: boolean;
+    /** `backgroundJobs.staleAfterMs`; silence budget for a busy lane. */
+    staleAfterMs?: number;
     revivedRunTracker?: RevivedRunTracker;
   },
 ) {
@@ -276,6 +280,10 @@ export function createTaskSessionManagerHook(
     input: _ctx,
     backgroundJobBoard,
     delayMs: options.runtimeStatusReconcileDelayMs,
+    silenceDetection: options.silenceDetection,
+    staleAfterMs: options.staleAfterMs,
+    // Resolved lazily: the input-wait tracker is created below.
+    hasInputWait: (sessionID) => hasInputWait(sessionID),
     taskContextTracker,
   });
 

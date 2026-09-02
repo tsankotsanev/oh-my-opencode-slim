@@ -1156,6 +1156,18 @@
           "minimum": 1000,
           "maximum": 60000
         },
+        "silenceDetection": {
+          "default": true,
+          "description": "When true, a background child session that OpenCode still reports as busy while emitting no output for longer than staleAfterMs is flagged on the board as status uncertain, with an excerpt of what it was last doing. Detects hung provider streams (e.g. a dropped connection) that no lifecycle event ever reports. Default enabled.",
+          "type": "boolean"
+        },
+        "staleAfterMs": {
+          "default": 300000,
+          "description": "Silence budget for a busy background child session before it is flagged as status uncertain (10,000–2,147,483,647ms). Default 300,000 (5 minutes). Lanes executing a tool, retrying a provider call, or awaiting a permission answer are exempt.",
+          "type": "integer",
+          "minimum": 10000,
+          "maximum": 2147483647
+        },
         "concurrency": {
           "default": {
             "defaultConcurrency": 0,
@@ -1166,7 +1178,7 @@
           "properties": {
             "defaultConcurrency": {
               "default": 0,
-              "description": "Maximum concurrently running native background tasks. 0 means unlimited.",
+              "description": "Maximum concurrently running native background tasks. 0 disables the default cap.",
               "type": "integer",
               "minimum": 0,
               "maximum": 1000

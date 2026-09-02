@@ -6,6 +6,7 @@ import type {
   BackgroundJobRecord,
   BackgroundJobStatusInput,
   ContextFile,
+  LaneProgress,
   WallClockTimeoutClaimInput,
   WallClockTimeoutFinalizeInput,
 } from './background-job-board';
@@ -248,6 +249,34 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
       expectedGeneration,
       now,
     );
+  }
+
+  recordActivity(
+    taskID: string,
+    now = Date.now(),
+    expectedGeneration?: number,
+  ): BackgroundJobRecord | undefined {
+    return this.board.recordActivity(taskID, now, expectedGeneration);
+  }
+
+  markSilenceDetected(
+    taskID: string,
+    reason: string,
+    options?: {
+      progress?: LaneProgress;
+      now?: number;
+      expectedGeneration?: number;
+    },
+  ): BackgroundJobRecord | undefined {
+    return this.board.markSilenceDetected(taskID, reason, options);
+  }
+
+  recordProgress(
+    taskID: string,
+    progress: LaneProgress,
+    expectedGeneration?: number,
+  ): BackgroundJobRecord | undefined {
+    return this.board.recordProgress(taskID, progress, expectedGeneration);
   }
 
   markReconciled(
