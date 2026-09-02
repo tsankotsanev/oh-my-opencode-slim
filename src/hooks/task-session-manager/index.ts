@@ -2,6 +2,7 @@ import type { PluginInput } from '@opencode-ai/plugin';
 import {
   BackgroundJobBoard,
   type BackgroundJobExecution,
+  type BackgroundJobRecord,
   type BackgroundJobStore,
   type BackgroundJobSupervisor,
   type BackgroundTaskConcurrency,
@@ -16,6 +17,7 @@ import {
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
 import {
+  consumeReviveIntent,
   consumeStopIntent,
   createServerSidecar,
   INTENT_RETENTION_MS,
@@ -29,6 +31,7 @@ import {
 } from '../../utils/lane-mirror';
 import { log } from '../../utils/logger';
 import { createLaneServerUrlResolver } from '../../utils/server-url';
+import { getRuntimeSessionStatusSnapshot } from '../../utils/session-runtime-status';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -41,6 +44,11 @@ import {
   stabilizeRunningTaskParts,
   updateFromInjectedCompletion,
 } from './board-injection';
+import {
+  type CascadeTracker,
+  createCascadeTracker,
+  type ReviveOnCascadeMode,
+} from './cascade-attribution';
 import { handleEvent } from './event-router';
 import { createIdleReconciler } from './idle-reconciliation';
 import { createIdleSessionTokens } from './idle-session-tokens';
@@ -49,6 +57,7 @@ import {
   createPendingCallTracker,
   type PendingCallTracker,
 } from './pending-call-tracker';
+import { adoptRevivedRun, resumeRetainedLane } from './revive-run';
 import type { RevivedRunTracker } from './revived-run-tracker';
 import { createRuntimeStatusReconciler } from './runtime-status-reconciliation';
 import { createTaskContextTracker } from './task-context-tracker';
@@ -232,6 +241,13 @@ export function createTaskSessionManagerHook(
     laneServerInfoFile?: string;
     laneIntentsFile?: string;
     revivedRunTracker?: RevivedRunTracker;
+    /**
+     * `backgroundJobs.reviveOnCascade` — EXPERIMENTAL automatic resume of the
+     * lanes one ESC killed. Defaults to `'off'`; attribution runs either way.
+     */
+    reviveOnCascade?: ReviveOnCascadeMode;
+    /** Test seam: overrides the cascade tracker's timings/callbacks. */
+    cascadeTracker?: CascadeTracker;
   },
 ) {
   const backgroundJobBoard =
@@ -487,6 +503,76 @@ export function createTaskSessionManagerHook(
         consumeStopIntent(laneIntentsFile, sessionID)
     : undefined;
 
+  // ── ESC attribution and recovery ───────────────────────────────────
+  const revivedRunTracker = options.revivedRunTracker;
+  const retainedRunDeps = revivedRunTracker
+    ? {
+        input: _ctx,
+        backgroundJobBoard,
+        backgroundJobSupervisor: options.backgroundJobSupervisor,
+        revivedRunTracker,
+      }
+    : undefined;
+
+  /**
+   * Adopt the run `omos lanes revive` started from another process.
+   *
+   * Needs the revived-run tracker: without it there would be nobody to
+   * synthesize the parent's terminal notification, which is the entire reason
+   * the CLI hands the run over instead of just prompting and walking away.
+   */
+  const adoptUserRevive =
+    laneIntentsFile && retainedRunDeps
+      ? async (sessionID: string): Promise<void> => {
+          try {
+            const adopted = await adoptRevivedRun(retainedRunDeps, sessionID);
+            log('[task-session-manager] lane revived by user (omos lanes)', {
+              sessionID,
+              alias: adopted?.alias,
+              generation: adopted?.generation,
+              adopted: adopted !== undefined,
+            });
+          } catch (error) {
+            log('[task-session-manager] user revive adoption failed', {
+              sessionID,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          laneMirror.scheduleFlush();
+        }
+      : undefined;
+
+  const cascadeTracker =
+    options.cascadeTracker ??
+    createCascadeTracker({
+      backgroundJobBoard,
+      mode: options.reviveOnCascade ?? 'off',
+      fetchSessionStatuses: () => getRuntimeSessionStatusSnapshot(_ctx),
+      // Absent when no tracker was wired: attribution still runs, but nothing
+      // is ever restarted, which is the safe half of the feature.
+      ...(retainedRunDeps
+        ? {
+            reviveLane: async (record: BackgroundJobRecord): Promise<void> => {
+              await resumeRetainedLane(retainedRunDeps, record);
+              laneMirror.scheduleFlush();
+            },
+          }
+        : {}),
+      ...(laneIntentsFile
+        ? {
+            claimStopIntent: (sessionID: string, sinceMs: number) =>
+              consumeStopIntent(laneIntentsFile, sessionID, {
+                withinMs: sinceMs,
+              }),
+          }
+        : {}),
+    });
+
+  const claimUserReviveIntent = laneIntentsFile
+    ? (sessionID: string): { at: number } | undefined =>
+        consumeReviveIntent(laneIntentsFile, sessionID)
+    : undefined;
+
   /**
    * Tear down this generation's writers, and let a newer generation take over.
    *
@@ -497,6 +583,13 @@ export function createTaskSessionManagerHook(
   const disposeLaneWriters = (): void => {
     laneMirror.dispose();
     laneServerSidecar.dispose();
+    // The cascade tracker belongs to this generation too, and for a sharper
+    // reason than the writers: the factory re-runs on every CONFIG update, so
+    // a pending auto-revive scheduled under `reviveOnCascade: 'auto'` would
+    // otherwise still fire after the user had just switched it to `'off'`.
+    // Dropping the pending restart is the direction the default already
+    // points in, and the newer generation owns detection from here on.
+    cascadeTracker.dispose();
     releaseLaneWriters(_ctx.directory, disposeLaneWriters);
   };
   if (laneControlEnabled) claimLaneWriters(_ctx.directory, disposeLaneWriters);
@@ -706,6 +799,7 @@ export function createTaskSessionManagerHook(
 
       if (input.event.type === 'server.instance.disposed') {
         runtimeStatusReconciler.dispose();
+        cascadeTracker.dispose();
         // Flush last, then drop the sidecar: a missing sidecar makes the CLI
         // say "start OpenCode or pass --server", whereas a stale one would
         // send it at a dead (or recycled) port.
@@ -729,7 +823,10 @@ export function createTaskSessionManagerHook(
         observeSyntheticTerminalPart: (part) =>
           observeSyntheticTerminalPart(injectionState, part),
         revivedRunTracker: options.revivedRunTracker,
+        cascade: cascadeTracker,
         ...(claimUserStopIntent ? { claimUserStopIntent } : {}),
+        ...(claimUserReviveIntent ? { claimUserReviveIntent } : {}),
+        ...(adoptUserRevive ? { adoptRevivedRun: adoptUserRevive } : {}),
       }).then(() => {
         runtimeStatusReconciler.schedule();
         laneMirror.scheduleFlush();

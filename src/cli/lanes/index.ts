@@ -21,6 +21,7 @@ import { LANES_HELP, type LanesArgs, parseLanesArgs } from './args';
 import {
   type LanesDeps,
   runLanesList,
+  runLanesRevive,
   runLanesSay,
   runLanesShow,
   runLanesStop,
@@ -113,6 +114,19 @@ export async function runLanesCommand(
             json: parsed.json,
             force: parsed.force,
             text: parsed.text,
+          },
+          deps,
+        );
+      case 'revive':
+        return await runLanesRevive(
+          {
+            directory,
+            ...(parsed.selector ? { selector: parsed.selector } : {}),
+            serverFlag: parsed.server,
+            json: parsed.json,
+            force: parsed.force,
+            cascade: parsed.cascade,
+            all: parsed.all,
           },
           deps,
         );

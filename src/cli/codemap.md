@@ -37,10 +37,10 @@ reached from a SECOND terminal while one long-lived orchestrator keeps running.
 Every state change is a direct SDK call to the OpenCode server, never a model
 turn.
 - **lanes/index.ts**: Entry point; resolves `--dir`, injects `LanesDeps` (IO, clock, SDK client factory, file seams), and turns any throw into one line plus exit 1
-- **lanes/args.ts**: Pure, total argument parser (`list`/`show`/`stop`/`say`, `--dir/--server/-n/--reason/--force/--json`); `revive` is a reserved subcommand that points at `task_revive`
+- **lanes/args.ts**: Pure, total argument parser (`list`/`show`/`stop`/`say`/`revive`, `--dir/--server/-n/--reason/--cascade/--all/--force/--json`); `revive` takes exactly one scope (a lane, `--cascade`, or `--all`) and every ambiguous combination is an error rather than a guess, because the command prompts real sessions
 - **lanes/board.ts**: READ-ONLY view of the lane mirror (`src/utils/lane-mirror.ts`), selector resolution (session id beats alias; a shared alias across two orchestrators is reported ambiguous, never guessed)
 - **lanes/server.ts**: Server discovery (`--server` → sidecar → `$OMO_OPENCODE_SERVER_URL`) with sidecar validation (dead pid / foreign directory / cold heartbeat), the minimal `LaneClient` SDK surface, dynamic SDK import, and error formatting
-- **lanes/commands.ts**: The four commands and all safety refusals — orchestrator-abort guards, pre-abort liveness check, intent-before-abort ordering, post-abort verification, cross-server active check, and the never-forceable agent rule (probe A2)
+- **lanes/commands.ts**: The five commands and all safety refusals — orchestrator-abort guards, pre-abort liveness check, intent-before-abort ordering, post-abort verification, cross-server active check, and the never-forceable agent rule (probe A2). `revive` performs the same operation `task_revive` does (`isReviveableRetainedJob` from `src/utils/lane-state.ts`, so the CLI cannot accept a lane the tool refuses), resumes the lane in its OWN session with agent AND model pinned, and writes a `revive` intent BEFORE prompting so the plugin registers the resulting run with the revived-run tracker (which is what notifies the orchestrator when it finishes). A busy lane is refused even with `--force`; `--cascade` selects the newest `killedByCascade.at` group; a lane the user stopped is excluded from the bulk scopes but revivable by name.
 
 **Import rule:** nothing under `src/cli/lanes/` imports from `src/hooks/`.
 Shared vocabulary (mirror paths/shapes, intent format, server-URL resolution,
@@ -201,12 +201,14 @@ omos lanes [list]                     # lanes recorded for this project (no serv
 omos lanes show <alias|ses_id> [-n N] # tail of a lane's transcript
 omos lanes stop <alias|ses_id> [--reason "…"]
 omos lanes say  <alias|ses_id> "<text>"
+omos lanes revive <alias|ses_id> | --cascade | --all
 ```
 
-**Options:** `--dir <path>`, `--server <url>`, `-n/--count <n>`, `--reason "<text>"`, `--force`, `--json`, `-h/--help`
+**Options:** `--dir <path>`, `--server <url>`, `-n/--count <n>`, `--reason "<text>"`, `--cascade`/`--all` (revive only), `--force`, `--json`, `-h/--help`
 
 **Behaviour notes:**
 - `list` reads only the mirror; every other command re-checks the live server first
 - `stop` writes its intent BEFORE aborting (the plugin claims it to label the record as the user's cancellation), then verifies the session went idle
 - `say` always carries the lane's own agent; `--force` never waives that
-- Refusal table and the multi-server caveat: `docs/background-orchestration.md#controlling-lanes-from-a-second-terminal`
+- `revive` resumes a lane in its own session, agent AND model pinned, and writes a `revive` intent BEFORE prompting so the plugin can register the run with the revived-run tracker; `--cascade` undoes the last ESC on the orchestrator (which aborts every lane it owns)
+- Refusal table, the ESC attribution rules and the multi-server caveat: `docs/background-orchestration.md#controlling-lanes-from-a-second-terminal` and `#esc-and-recovery`

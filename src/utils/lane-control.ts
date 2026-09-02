@@ -12,7 +12,8 @@
  * documents the full file table and the one-writer-per-file rule):
  *
  *   - `<key>.server.json` — plugin → CLI: where this directory's server lives.
- *   - `<key>.intents.jsonl` — CLI → plugin: why a lane was just aborted.
+ *   - `<key>.intents.jsonl` — CLI → plugin: why a lane was just aborted, or
+ *     that the busy signal about to arrive is a resume the user asked for.
  *
  * Nothing here may throw into a hook path: the sidecar runs inside plugin
  * startup and the intent lookup runs inside the event pipeline, so every entry
@@ -54,6 +55,23 @@ const DEFAULT_SIDECAR_MIN_WRITE_INTERVAL_MS = 30_000;
 /** A `stop` intent only explains an abort that follows it almost immediately. */
 export const STOP_INTENT_WINDOW_MS = 60_000;
 
+/**
+ * A `revive` intent only explains the busy signal that follows it.
+ *
+ * Same order of magnitude as the stop window and for the same reason: the CLI
+ * writes the line, then prompts, and the server emits `session.status{busy}`
+ * within milliseconds. A minute is generous slack for a loaded host.
+ *
+ * Beyond that the line expires unread, and the consequence is worth being
+ * precise about: the SESSION still resumes (the prompt was already accepted
+ * and the lane does the work), but nothing registers a new generation for it,
+ * so the board keeps the terminal record it already had — a live busy signal
+ * on a canonical terminal record only refreshes `lastLiveBusyAt`. The lane
+ * therefore still reads as interrupted, and no `<task>` notification is
+ * synthesized when it finishes.
+ */
+export const REVIVE_INTENT_WINDOW_MS = 60_000;
+
 /** Intent lines older than this are ignored and pruned on the next read. */
 export const INTENT_RETENTION_MS = 600_000;
 
@@ -75,16 +93,41 @@ export interface ServerInfo {
   updatedAt: number;
 }
 
+/**
+ * The one resume prompt, shared by `omos lanes revive` and the plugin's
+ * cascade auto-revive.
+ *
+ * It lives here — in the module both sides already share for lane control —
+ * rather than beside either caller, because `src/cli/` must not import from
+ * `src/hooks/`, and because the two paths sending *different* text would be an
+ * invisible inconsistency in what a resumed lane is told.
+ *
+ * The text deliberately adds no task instructions: the lane's session survived
+ * the abort intact, so its original prompt, plan and tool history are all
+ * still in context, and anything added here would compete with them.
+ *
+ * The one thing it must say is the thing the lane cannot know: an abort can
+ * land MID-operation, so the last tool call it remembers issuing may have
+ * completed, partially completed, or never run. Re-doing an `edit` or a
+ * migration blind is the one way a resume can be worse than a relaunch.
+ */
+export const RESUME_PROMPT_TEXT =
+  'You were interrupted by an abort. Continue your original task from where you left off; your earlier instructions still stand. Before repeating any file edit or command you were in the middle of, re-check its current state first. Finish with the same final report format.';
+
+/** What a recorded CLI action was. */
+export type LaneIntentAction = 'stop' | 'revive';
+
 /** One user action taken from the CLI, recorded for the plugin to interpret. */
 export interface LaneIntent {
   at: number;
-  action: 'stop';
+  action: LaneIntentAction;
   sessionID: string;
   reason?: string;
 }
 
-const LANE_INTENT_ACTIONS: ReadonlySet<string> = new Set<LaneIntent['action']>([
+const LANE_INTENT_ACTIONS: ReadonlySet<string> = new Set<LaneIntentAction>([
   'stop',
+  'revive',
 ]);
 
 export function serverInfoPath(directory: string): string {
@@ -385,19 +428,21 @@ export function readLaneIntents(
 }
 
 /**
- * Claim the newest `stop` intent that explains an abort of `sessionID`.
+ * Claim the newest intent of `action` that explains an event on `sessionID`.
  *
  * "Claim" is literal: the matched line is removed from the file so a later
- * abort of the same lane (a genuine cascade after a user cancel, say) cannot
- * be mislabelled by a reused line. Surviving lines are rewritten atomically,
- * which also prunes everything expired.
+ * event of the same kind on the same lane (a genuine cascade after a user
+ * cancel, or a second revive) cannot be mislabelled by a reused line.
+ * Surviving lines are rewritten atomically, which also prunes everything
+ * expired.
  *
  * Returns `undefined` when there is no recent matching intent — the normal
  * case, and the cheapest path (missing file → one failed `readFileSync`).
  */
-export function consumeStopIntent(
+export function consumeLaneIntent(
   file: string,
   sessionID: string,
+  action: LaneIntentAction,
   options: { now?: number; withinMs?: number; retentionMs?: number } = {},
 ): LaneIntent | undefined {
   const now = options.now ?? Date.now();
@@ -413,7 +458,7 @@ export function consumeStopIntent(
   let matchIndex = -1;
   for (let index = intents.length - 1; index >= 0; index--) {
     const intent = intents[index] as LaneIntent;
-    if (intent.action !== 'stop' || intent.sessionID !== sessionID) continue;
+    if (intent.action !== action || intent.sessionID !== sessionID) continue;
     // Future-dated lines (clock skew between the two processes) still count as
     // "recent": the alternative is silently ignoring a real user action.
     if (now - intent.at > withinMs) continue;
@@ -433,6 +478,38 @@ export function consumeStopIntent(
     ...intents.slice(matchIndex + 1),
   ]);
   return matched;
+}
+
+/** Claim the `stop` intent that explains an abort of `sessionID`, if any. */
+export function consumeStopIntent(
+  file: string,
+  sessionID: string,
+  options: { now?: number; withinMs?: number; retentionMs?: number } = {},
+): LaneIntent | undefined {
+  return consumeLaneIntent(file, sessionID, 'stop', options);
+}
+
+/**
+ * Claim the `revive` intent that explains a busy signal on `sessionID`.
+ *
+ * Only ever consulted for a lane the board already holds as a settled,
+ * retained record, so the normal busy path never touches the disk.
+ *
+ * A miss is not fatal but it is not free either: the session resumes regardless
+ * (the CLI has already prompted it), but the run is not handed to the
+ * revived-run tracker, so the board keeps showing the lane as interrupted and
+ * the parent is never told how the resumed run ended. The CLI says so when it
+ * fails to record the line.
+ */
+export function consumeReviveIntent(
+  file: string,
+  sessionID: string,
+  options: { now?: number; withinMs?: number; retentionMs?: number } = {},
+): LaneIntent | undefined {
+  return consumeLaneIntent(file, sessionID, 'revive', {
+    withinMs: REVIVE_INTENT_WINDOW_MS,
+    ...options,
+  });
 }
 
 /**

@@ -389,11 +389,19 @@ describe('task-session-manager lane-control wiring', () => {
     rmSync(projectDir, { recursive: true, force: true });
   });
 
-  function createHook(laneControl: boolean, board: BackgroundJobBoard) {
+  function createHook(
+    laneControl: boolean,
+    board: BackgroundJobBoard,
+    overrides: {
+      client?: unknown;
+      revivedRunTracker?: unknown;
+      cascadeTracker?: unknown;
+    } = {},
+  ) {
     return createTaskSessionManagerHook(
       {
         directory: projectDir,
-        client: {},
+        client: overrides.client ?? {},
       } as never,
       {
         maxSessionsPerAgent: 3,
@@ -403,9 +411,55 @@ describe('task-session-manager lane-control wiring', () => {
         laneControl,
         // No status polling in this test: the reconciler needs a real client.
         runtimeStatusReconcileDelayMs: 10_000_000,
+        ...(overrides.revivedRunTracker
+          ? { revivedRunTracker: overrides.revivedRunTracker as never }
+          : {}),
+        ...(overrides.cascadeTracker
+          ? { cascadeTracker: overrides.cascadeTracker as never }
+          : {}),
       },
     );
   }
+
+  function fakeCascadeTracker() {
+    return {
+      noteChildAbort: mock(() => {}),
+      noteOrchestratorAbort: mock(() => {}),
+      noteOrchestratorBusy: mock(() => {}),
+      noteOrchestratorIdle: mock(() => {}),
+      flushAutoRevive: mock(async () => {}),
+      dispose: mock(() => {}),
+    };
+  }
+
+  test('server disposal tears the cascade tracker down', async () => {
+    const cascadeTracker = fakeCascadeTracker();
+    const hook = createHook(true, runningBoard(), { cascadeTracker });
+
+    await hook.event({
+      event: { type: 'server.instance.disposed', properties: {} },
+    } as never);
+
+    expect(cascadeTracker.dispose).toHaveBeenCalled();
+  });
+
+  /**
+   * The plugin factory re-runs on every CONFIG update. A restart still pending
+   * under `reviveOnCascade: 'auto'` must not fire after the user has just
+   * switched it to `'off'`, so the generation that loses the directory loses
+   * its tracker with it.
+   */
+  test('a newer hook generation tears down the previous cascade tracker', () => {
+    const first = fakeCascadeTracker();
+    createHook(true, runningBoard(), { cascadeTracker: first });
+    expect(first.dispose).not.toHaveBeenCalled();
+
+    const second = fakeCascadeTracker();
+    createHook(true, runningBoard(), { cascadeTracker: second });
+
+    expect(first.dispose).toHaveBeenCalled();
+    expect(second.dispose).not.toHaveBeenCalled();
+  });
 
   test('an event flushes the mirror and publishes the sidecar', async () => {
     const board = runningBoard();
@@ -596,5 +650,215 @@ describe('task-session-manager lane-control wiring', () => {
       path.join(import.meta.dir, '..', '..', 'index.ts'),
     ).text();
     expect(source).toContain('laneControl: runtime.backgroundJobs.laneControl');
+    expect(source).toContain(
+      'reviveOnCascade: runtime.backgroundJobs.reviveOnCascade',
+    );
+  });
+
+  /**
+   * `omos lanes revive` prompts from ANOTHER process, so the plugin only ever
+   * sees a settled lane going busy. Claiming the intent it left behind is what
+   * turns that into a registered revived run — which is what makes the parent
+   * receive a `<task>` notification when the resumed lane finishes (probe B2:
+   * nothing else ever tells it).
+   */
+  function reviveHarness(board: BackgroundJobBoard) {
+    const registered: unknown[] = [];
+    const revivedRunTracker = {
+      captureBaseline: mock(async () => 'should-not-be-used'),
+      register: mock((input: unknown) => {
+        registered.push(input);
+      }),
+      isTracked: mock(() => true),
+      probe: mock(async () => false),
+      onTerminal: mock(() => {}),
+      dispose: mock(() => {}),
+    };
+    const client = {
+      session: {
+        messages: mock(async () => ({
+          data: [
+            { info: { id: 'msg_user', role: 'user' }, parts: [] },
+            {
+              info: {
+                id: 'msg_assistant_aborted',
+                role: 'assistant',
+                time: { completed: 5 },
+              },
+              parts: [],
+            },
+            // The turn the CLI just started: in flight, so it must NOT become
+            // the tracker's baseline (nothing would ever come "after" it).
+            { info: { id: 'msg_resume', role: 'user' }, parts: [] },
+            { info: { id: 'msg_live', role: 'assistant' }, parts: [] },
+          ],
+        })),
+      },
+    };
+    const hook = createHook(true, board, { client, revivedRunTracker });
+    return { hook, revivedRunTracker, registered, client };
+  }
+
+  test('a claimed revive intent registers the run and labels the record', async () => {
+    const board = runningBoard();
+    board.updateStatus({ taskID: 'child-1', state: 'error' });
+    const generationBefore = board.get('child-1')?.generation as number;
+    const { hook, revivedRunTracker, registered } = reviveHarness(board);
+    const intentsFile = laneIntentsPath(projectDir);
+    appendLaneIntent(intentsFile, {
+      at: Date.now(),
+      action: 'revive',
+      sessionID: 'child-1',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'child-1', status: { type: 'busy' } },
+      },
+    } as never);
+
+    const record = board.get('child-1');
+    expect(record?.state).toBe('running');
+    expect(record?.generation).toBeGreaterThan(generationBefore);
+    expect(record?.revivedByUser).toBeDefined();
+    expect(registered).toEqual([
+      expect.objectContaining({
+        taskID: 'child-1',
+        generation: record?.generation,
+        parentSessionID: 'parent-1',
+        // The last SETTLED message, not the turn now in flight.
+        baselineMessageID: 'msg_resume',
+      }),
+    ]);
+    expect(revivedRunTracker.probe).toHaveBeenCalled();
+    // Claimed: a later busy signal must not re-adopt the same run.
+    expect(readLaneIntents(intentsFile)).toEqual([]);
+    expect(
+      readLaneMirror(laneMirrorPath(projectDir))?.lanes[0]?.revivedByUser,
+    ).toBeDefined();
+  });
+
+  test('a busy signal with no intent behind it is left alone', async () => {
+    const board = runningBoard();
+    board.updateStatus({ taskID: 'child-1', state: 'error' });
+    const { hook, registered } = reviveHarness(board);
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'child-1', status: { type: 'busy' } },
+      },
+    } as never);
+
+    expect(registered).toEqual([]);
+    expect(board.get('child-1')?.state).toBe('error');
+    expect(board.get('child-1')?.revivedByUser).toBeUndefined();
+  });
+
+  test('a running lane never consults the revive intents', async () => {
+    const board = runningBoard();
+    const { hook, registered } = reviveHarness(board);
+    const intentsFile = laneIntentsPath(projectDir);
+    appendLaneIntent(intentsFile, {
+      at: Date.now(),
+      action: 'revive',
+      sessionID: 'child-1',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'child-1', status: { type: 'busy' } },
+      },
+    } as never);
+
+    expect(registered).toEqual([]);
+    expect(readLaneIntents(intentsFile)).toHaveLength(1);
+  });
+
+  test('an ESC on the orchestrator is attributed end to end', async () => {
+    // The B1 ordering, through the real event router: child first, parent ~0.1s
+    // later. One lane is enough when the parent's own abort is the evidence.
+    const board = runningBoard();
+    const { hook } = reviveHarness(board);
+
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'child-1', error: ABORT_ERROR },
+      },
+    } as never);
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'parent-1', error: ABORT_ERROR },
+      },
+    } as never);
+
+    const record = board.get('child-1');
+    expect(record?.state).toBe('error');
+    expect(record?.killedByCascade?.parentSessionID).toBe('parent-1');
+    // (The mirror picks the stamp up on its next debounced flush; the
+    // projection itself is pinned in lane-mirror.test.ts.)
+  });
+
+  test('a lane the user stopped is never attributed to the ESC', async () => {
+    const board = runningBoard();
+    const { hook } = reviveHarness(board);
+    appendLaneIntent(laneIntentsPath(projectDir), {
+      at: Date.now(),
+      action: 'stop',
+      sessionID: 'child-1',
+      reason: 'wrong file set',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'child-1', error: ABORT_ERROR },
+      },
+    } as never);
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'parent-1', error: ABORT_ERROR },
+      },
+    } as never);
+
+    expect(board.get('child-1')?.cancelledByUser).toBeDefined();
+    expect(board.get('child-1')?.killedByCascade).toBeUndefined();
+  });
+
+  test('a foreground-fallback abort of the orchestrator is not an ESC', async () => {
+    const board = runningBoard();
+    const hook = createTaskSessionManagerHook(
+      { directory: projectDir, client: {} } as never,
+      {
+        maxSessionsPerAgent: 3,
+        maxRetainedSnapshots: 5,
+        backgroundJobBoard: board,
+        shouldManageSession: (sessionID: string) => sessionID === 'parent-1',
+        laneControl: true,
+        runtimeStatusReconcileDelayMs: 10_000_000,
+        // Fallback aborts the session to swap models: that abort is ours.
+        isFallbackInProgress: (sessionID: string) => sessionID === 'parent-1',
+      },
+    );
+
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'child-1', error: ABORT_ERROR },
+      },
+    } as never);
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'parent-1', error: ABORT_ERROR },
+      },
+    } as never);
+
+    expect(board.get('child-1')?.killedByCascade).toBeUndefined();
   });
 });

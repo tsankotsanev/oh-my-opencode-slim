@@ -29,31 +29,42 @@ export interface LanesTargetedArgs extends LanesCommonArgs {
   force: boolean;
 }
 
+/**
+ * `revive` is the one command that can address more than one lane, because the
+ * event it undoes (one ESC) kills more than one lane. Its selector is
+ * therefore optional and mutually exclusive with the two bulk scopes.
+ */
+export interface LanesReviveArgs extends LanesCommonArgs {
+  selector?: string;
+  server?: string;
+  force: boolean;
+  /** Lanes killed by the most recent orchestrator cascade. */
+  cascade: boolean;
+  /** Every revivable lane an abort left behind. */
+  all: boolean;
+}
+
 export type LanesArgs =
   | { command: 'help' }
   | { command: 'error'; message: string }
   | ({ command: 'list' } & LanesCommonArgs)
   | ({ command: 'show'; count: number } & LanesTargetedArgs)
   | ({ command: 'stop'; reason?: string } & LanesTargetedArgs)
-  | ({ command: 'say'; text: string } & LanesTargetedArgs);
+  | ({ command: 'say'; text: string } & LanesTargetedArgs)
+  | ({ command: 'revive' } & LanesReviveArgs);
 
 const DEFAULT_SHOW_COUNT = 20;
 const MAX_SHOW_COUNT = 500;
 
-const KNOWN_SUBCOMMANDS = new Set(['list', 'show', 'stop', 'say']);
+const KNOWN_SUBCOMMANDS = new Set(['list', 'show', 'stop', 'say', 'revive']);
 
 /**
- * Subcommands that are planned but not implemented yet.
- *
- * Named explicitly so `omos lanes revive fix-1` gets a straight answer instead
- * of being reinterpreted as `list` with a stray positional.
+ * Subcommands that are named but not implemented, so a user who types one gets
+ * a straight answer instead of having it reinterpreted as `list` with a stray
+ * positional. Empty today (`revive` graduated); kept as the seam for the next
+ * one.
  */
-const RESERVED_SUBCOMMANDS = new Map<string, string>([
-  [
-    'revive',
-    'Reviving a lane is not available from the CLI yet. Ask the orchestrator to run task_revive(task_id: "<alias>"); a stopped lane keeps its session, so it can be resumed in place.',
-  ],
-]);
+const RESERVED_SUBCOMMANDS = new Map<string, string>();
 
 interface Flags {
   dir?: string;
@@ -61,6 +72,8 @@ interface Flags {
   reason?: string;
   json: boolean;
   force: boolean;
+  cascade: boolean;
+  all: boolean;
   count?: number;
   positionals: string[];
   error?: string;
@@ -78,6 +91,8 @@ function parseFlags(args: string[]): Flags {
   const flags: Flags = {
     json: false,
     force: false,
+    cascade: false,
+    all: false,
     positionals: [],
   };
 
@@ -123,6 +138,16 @@ function parseFlags(args: string[]): Flags {
 
     if (arg === '--force') {
       flags.force = true;
+      continue;
+    }
+
+    if (arg === '--cascade') {
+      flags.cascade = true;
+      continue;
+    }
+
+    if (arg === '--all') {
+      flags.all = true;
       continue;
     }
 
@@ -192,6 +217,55 @@ export function parseLanesArgs(args: string[]): LanesArgs {
   if (flags.error) return { command: 'error', message: flags.error };
 
   const common: LanesCommonArgs = { dir: flags.dir, json: flags.json };
+
+  // The bulk scopes exist because one ESC kills many lanes at once. Nothing
+  // else addresses more than one lane, and silently ignoring the flag on a
+  // command that aborts or prompts would be the wrong kind of forgiving.
+  if ((flags.cascade || flags.all) && subcommand !== 'revive') {
+    return {
+      command: 'error',
+      message: `${flags.cascade ? '--cascade' : '--all'} only applies to "lanes revive"`,
+    };
+  }
+
+  if (subcommand === 'revive') {
+    const [target, ...rest] = flags.positionals;
+    if (rest.length > 0) {
+      return {
+        command: 'error',
+        message: `Unexpected argument for "lanes revive": ${rest[0]}. Revive one lane by name, or use --cascade / --all.`,
+      };
+    }
+    if (flags.cascade && flags.all) {
+      return {
+        command: 'error',
+        message:
+          '--cascade and --all select different sets; pass exactly one (--cascade = the lanes the last ESC killed)',
+      };
+    }
+    if (target && (flags.cascade || flags.all)) {
+      return {
+        command: 'error',
+        message: `"lanes revive ${target}" already names a lane; drop ${flags.cascade ? '--cascade' : '--all'}`,
+      };
+    }
+    if (!target && !flags.cascade && !flags.all) {
+      return {
+        command: 'error',
+        message:
+          '"lanes revive" needs a lane alias, --cascade (the lanes the last ESC killed), or --all',
+      };
+    }
+    return {
+      command: 'revive',
+      ...common,
+      ...(target ? { selector: target } : {}),
+      server: flags.server,
+      force: flags.force,
+      cascade: flags.cascade,
+      all: flags.all,
+    };
+  }
 
   if (subcommand === 'list') {
     if (flags.force) {
@@ -270,6 +344,11 @@ Commands:
   show   <alias|ses_id>      Print the tail of a lane's transcript
   stop   <alias|ses_id>      Abort one lane (the session survives, resumable)
   say    <alias|ses_id> ...  Queue an instruction for a running lane
+  revive <alias|ses_id>      Resume a lane an abort left behind, in its own
+                             session, with its history intact
+  revive --cascade           Resume every lane the last ESC on the orchestrator
+                             killed (one ESC aborts the whole session tree)
+  revive --all               Resume every revivable interrupted lane here
 
 Options:
   --dir <path>               Project directory (default: current directory)
@@ -277,6 +356,8 @@ Options:
                              written by the plugin, or $OMO_OPENCODE_SERVER_URL)
   -n, --count <n>            Messages to print for "show" (default: 20)
   --reason "<text>"          Why you stopped the lane; shown to the orchestrator
+  --cascade                  "revive" only: the lanes the last ESC killed
+  --all                      "revive" only: every revivable interrupted lane
   --force                    Override the safety refusals (see Notes)
   --json                     Machine-readable output
   -h, --help                 Show this message
@@ -287,6 +368,8 @@ Examples:
   omos lanes show fix-1 -n 5
   omos lanes stop ora-2 --reason "wrong file set"
   omos lanes say fix-1 "also update the codemap"
+  omos lanes revive --cascade          # undo the ESC you just pressed
+  omos lanes revive fix-1
 
 Notes:
   - "list" reads a local mirror the plugin writes. It is a convenience copy,
@@ -298,6 +381,17 @@ Notes:
   - "stop" leaves the session intact; the orchestrator learns about it on its
     next turn at no token cost, labelled as your cancellation, and can resume
     the lane in place with task_revive.
+  - "revive" resumes a lane in its OWN session, so its full history is still in
+    context; it never starts a new one. It refuses a lane that is busy on this
+    server (not even with --force): that lane is either already running or
+    lives on another server, and prompting it would start a second concurrent
+    turn. The orchestrator is notified when the resumed lane finishes, exactly
+    as if it had run task_revive itself.
+  - ESC on the orchestrator aborts every lane it owns (this is OpenCode
+    behaviour the plugin cannot prevent). Those lanes are labelled on the board
+    as interrupted by ESC, and "revive --cascade" resumes that group.
+  - A lane you stopped yourself is never included in --cascade or --all; name
+    it explicitly to reverse your own decision.
   - These commands refuse, and suggest --force, when the target is not a
     verified background child (aborting an orchestrator kills ALL of its lanes
     — use ESC in the TUI for that), is not active on the target server, or is

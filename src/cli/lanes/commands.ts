@@ -33,8 +33,13 @@ import {
   type ContinuationModelSelection,
   parseContinuationModelSelection,
 } from '../../utils/continuation-model-selection';
-import { appendLaneIntent, laneIntentsPath } from '../../utils/lane-control';
+import {
+  appendLaneIntent,
+  laneIntentsPath,
+  RESUME_PROMPT_TEXT,
+} from '../../utils/lane-control';
 import type { LaneMirrorRecord } from '../../utils/lane-mirror';
+import { isReviveableRetainedJob } from '../../utils/lane-state';
 import { withAgent } from '../../utils/prompt-agent';
 import { isKnownParentSession, loadLaneBoard, resolveLane } from './board';
 import {
@@ -808,13 +813,15 @@ function reportAlreadyStopped(input: {
   );
   if (recorded) {
     deps.out('Recorded as your cancellation; nothing was aborted.');
+    deps.out(
+      'It will not be resumed by an automatic cascade revive, and it is',
+    );
+    deps.out('excluded from "omos lanes revive --cascade / --all".');
   } else {
     deps.out('Note: the cancellation could not be recorded.');
   }
-  deps.out(
-    'Its session survives, so the orchestrator can resume it in place with',
-  );
-  deps.out('task_revive if you change your mind.');
+  deps.out('Its session survives, so you can still change your mind with');
+  deps.out(`"omos lanes revive ${lane.alias}" (or ask for task_revive).`);
   return 0;
 }
 
@@ -995,12 +1002,21 @@ export async function runLanesStop(
     );
     deps.err('Re-run to abort again, or check the server logs.');
   }
-  deps.out('The session itself survives and stays resumable (task_revive).');
+  deps.out('The session itself survives and stays resumable (task_revive, or');
+  deps.out(`"omos lanes revive ${lane?.alias ?? sessionID}").`);
   if (recorded) {
     deps.out(
-      'The orchestrator will see this as your cancellation on its next turn',
+      'The orchestrator will see this as your cancellation on its next turn,',
     );
-    deps.out('(no extra prompt, no token cost).');
+    // Precise on purpose. A first-generation lane's death reaches the model
+    // through the board, which is injected into a turn it was going to take
+    // anyway - genuinely free. A REVIVED lane is tracked by the revived-run
+    // tracker, which synthesizes a <task> notification and therefore does
+    // start a turn. Claiming "no extra prompt" for both was wrong.
+    deps.out('at no token cost - unless this lane had been revived, in which');
+    deps.out(
+      'case the plugin notifies the orchestrator directly (one short turn).',
+    );
   } else {
     deps.out(
       'Note: the cancellation reason could not be recorded, so the orchestrator',
@@ -1359,4 +1375,448 @@ export async function runLanesSay(
   );
   deps.out('so treat this as course-correction, not a private side channel.');
   return 0;
+}
+
+// ── revive ─────────────────────────────────────────────────────
+
+export interface LanesReviveOptions {
+  directory: string;
+  /** Exactly one of `selector` / `cascade` / `all` is set (see args.ts). */
+  selector?: string;
+  serverFlag?: string;
+  json: boolean;
+  force?: boolean;
+  cascade: boolean;
+  all: boolean;
+}
+
+interface ReviveOutcome {
+  alias?: string;
+  sessionID: string;
+  agent?: string;
+  revived: boolean;
+  modelPinned?: boolean;
+  /** Why this lane was NOT resumed. Set only when `revived` is false. */
+  reason?: string;
+  /**
+   * Caveats attached to a resume that DID happen.
+   *
+   * Separate from `reason` because a forced resume can accumulate more than
+   * one (unreadable status *and* an unpinnable model), and because a caller
+   * reading `--json` must be able to tell "resumed with reservations" from
+   * "not resumed" without parsing prose.
+   */
+  notes?: string[];
+}
+
+/**
+ * The outcome a settled record carries, seeing through `reconciled`.
+ *
+ * `reconciled` means "the orchestrator has been told", not a different fate:
+ * an ESC-killed lane is `error` + unreconciled at first and becomes
+ * `reconciled` with `terminalState: 'error'` the moment the parent takes a
+ * turn. Treating those as two different things would make `revive --cascade`
+ * silently stop working a minute after the ESC.
+ */
+function terminalOutcomeOf(lane: LaneMirrorRecord): string {
+  return lane.state === 'reconciled'
+    ? (lane.terminalState ?? lane.state)
+    : lane.state;
+}
+
+/**
+ * Is this lane one an abort left behind, intact and resumable?
+ *
+ * Starts from the SAME predicate `task_revive` applies
+ * (`src/utils/lane-state.ts`) — a CLI that accepted a lane the tool refuses
+ * would be a second, quieter policy — and then narrows it once, because this
+ * command has only ONE prompt to send: the resume text. That text is a lie to
+ * a lane that finished, which is a follow-up job for `task_revive` with a real
+ * prompt.
+ */
+function revivabilityOf(
+  lane: LaneMirrorRecord,
+): { ok: true } | { ok: false; why: string } {
+  if (isReviveableRetainedJob(lane)) {
+    if (terminalOutcomeOf(lane) === 'completed') {
+      return {
+        ok: false,
+        why: 'it finished normally - there is nothing to resume; ask the orchestrator for task_revive with a real follow-up prompt',
+      };
+    }
+    return { ok: true };
+  }
+  if (lane.state === 'running') {
+    return {
+      ok: false,
+      why: 'it is still running - nothing was interrupted',
+    };
+  }
+  if (lane.statusUncertain) {
+    return {
+      ok: false,
+      why: 'its state is uncertain, so it may still be mid-turn (check "omos lanes show" first)',
+    };
+  }
+  return {
+    ok: false,
+    why: `it is ${lane.state}, which keeps no resumable run`,
+  };
+}
+
+/**
+ * Revivable, and not something the user stopped on purpose.
+ *
+ * A lane the user cancelled themselves IS revivable by name — naming it is the
+ * explicit reversal of their own decision — but it is never swept up by a bulk
+ * selector, which must not undo a deliberate stop. Orchestrator-owned cancels
+ * (`cancelled`) are excluded for the same reason.
+ */
+function isBulkRevivable(lane: LaneMirrorRecord): boolean {
+  return (
+    terminalOutcomeOf(lane) === 'error' &&
+    lane.cancelledByUser === undefined &&
+    isReviveableRetainedJob(lane)
+  );
+}
+
+/**
+ * Lanes killed by the MOST RECENT orchestrator cascade.
+ *
+ * Grouped by exact `killedByCascade.at`, which the plugin sets to one shared
+ * confirmation instant per cascade. Older cascades are deliberately excluded:
+ * `--cascade` means "undo the ESC I just pressed", not "restart everything
+ * that has ever been interrupted here" (that is `--all`).
+ */
+function selectLatestCascade(lanes: LaneMirrorRecord[]): LaneMirrorRecord[] {
+  const eligible = lanes.filter(
+    (lane) => isBulkRevivable(lane) && lane.killedByCascade !== undefined,
+  );
+  if (eligible.length === 0) return [];
+  const latest = Math.max(
+    ...eligible.map((lane) => lane.killedByCascade?.at ?? 0),
+  );
+  return eligible.filter((lane) => lane.killedByCascade?.at === latest);
+}
+
+/**
+ * Resume interrupted lanes in their own sessions, for zero orchestrator turns.
+ *
+ * This performs the same operation `task_revive` does, and deliberately leaves
+ * a `revive` intent on disk BEFORE prompting: the plugin claims that line when
+ * the resulting busy signal arrives, registers a new run generation and hands
+ * it to the revived-run tracker — which is what makes the orchestrator receive
+ * a `<task>` notification when the resumed lane finishes. Without the intent
+ * the lane would still resume, but its result would reach the parent only via
+ * the board, and probe B2 says nothing else ever tells it.
+ */
+export async function runLanesRevive(
+  args: LanesReviveOptions,
+  deps: LanesDeps,
+): Promise<number> {
+  const { directory, selector, serverFlag, json, force, cascade, all } = args;
+  const now = deps.now ?? (() => Date.now());
+  const board = loadLaneBoard(directory, deps.boardFile);
+
+  let targets: LaneMirrorRecord[];
+  let client: LaneClient;
+  let serverUrl: string;
+
+  if (selector) {
+    // Single named lane: reuse the shared resolution so a mistyped
+    // orchestrator id is refused here exactly as it is for stop/say.
+    const resolved = await resolveTarget(
+      directory,
+      selector,
+      serverFlag,
+      deps,
+      {
+        force,
+        mutating: true,
+      },
+    );
+    if (typeof resolved === 'number') return resolved;
+    client = resolved.client;
+    serverUrl = resolved.serverUrl;
+
+    if (!resolved.lane) {
+      // No mirror record means no recorded agent, and a resume cannot proceed
+      // without one (probe A2). Not overridable by --force.
+      deps.err(`No lane record for "${selector}", so its agent is unknown.`);
+      deps.err(
+        "Resuming without the session's own agent would permanently rewrite it",
+      );
+      deps.err(
+        'to the default "build" agent, so this command refuses to guess.',
+      );
+      deps.err('Run "omos lanes list" to find the alias.');
+      return 1;
+    }
+
+    const revivable = revivabilityOf(resolved.lane);
+    if (!revivable.ok) {
+      if (!force) {
+        deps.err(
+          `Refusing to revive ${resolved.lane.alias}: ${revivable.why}.`,
+        );
+        deps.err('Use --force if you really mean to prompt it.');
+        return 1;
+      }
+      // --force is an override, not an absolution: say what is being
+      // overridden. A user who forced past "it finished normally" and then
+      // reads a bare "Revived 1 lane" has no way to notice they just sent a
+      // resume prompt to a lane that had nothing to resume.
+      deps.err(
+        `Forcing ${resolved.lane.alias}: normally refused because ${revivable.why}.`,
+      );
+      deps.err('Resuming it anyway with the standard resume prompt.');
+    }
+    targets = [resolved.lane];
+  } else {
+    // `parseLanesArgs` guarantees exactly one scope, but be explicit anyway: a
+    // caller that accidentally sets none must revive NOTHING rather than fall
+    // through to "every interrupted lane in the project".
+    if (!cascade && !all) {
+      deps.err(
+        'Nothing selected: name a lane, or pass --cascade / --all (see "omos lanes revive --help").',
+      );
+      return 1;
+    }
+    const selected = cascade
+      ? selectLatestCascade(board.lanes)
+      : board.lanes.filter(isBulkRevivable);
+
+    if (selected.length === 0) {
+      const scope = cascade
+        ? 'lanes interrupted by an ESC on the orchestrator'
+        : 'interrupted lanes';
+      if (json) {
+        deps.out(
+          JSON.stringify(
+            { action: 'revive', directory, revived: [], skipped: [] },
+            null,
+            2,
+          ),
+        );
+        return 0;
+      }
+      deps.out(`No ${scope} to revive in ${directory}.`);
+      if (cascade && board.lanes.some(isBulkRevivable)) {
+        deps.out(
+          'There are interrupted lanes, but none is attributed to an ESC cascade.',
+        );
+        deps.out('Revive one by name, or use --all.');
+      }
+      return 0;
+    }
+
+    const opened = await openLaneClient(directory, serverFlag, deps);
+    if (typeof opened === 'number') return opened;
+    client = opened.client;
+    serverUrl = opened.serverUrl;
+    targets = selected;
+  }
+
+  // One status read for every target, ALWAYS — `--force` does not skip it.
+  // What --force overrides is the board-state refusal above; liveness is a
+  // different question with a different failure mode. A busy lane is not an
+  // interrupted one: either it was already revived, or the mirror belongs to a
+  // different server and prompting here starts a concurrent turn on a session
+  // another process is mid-turn in. That is a corruption class, so it is
+  // refused even under --force. Only `unknown` is forceable.
+  const statuses = await readStatusMap(client, directory);
+  const intentsFile = deps.intentsFile ?? laneIntentsPath(directory);
+  const outcomes: ReviveOutcome[] = [];
+
+  for (const lane of targets) {
+    const agent = lane.agent?.trim();
+    if (!agent) {
+      outcomes.push({
+        alias: lane.alias,
+        sessionID: lane.sessionID,
+        revived: false,
+        reason:
+          'no recorded agent; prompting without it would rewrite the session to "build"',
+      });
+      continue;
+    }
+
+    const live = statusOf(statuses, lane.sessionID);
+    if (live === 'busy' || live === 'retry') {
+      outcomes.push({
+        alias: lane.alias,
+        sessionID: lane.sessionID,
+        agent,
+        revived: false,
+        reason: `not idle on ${serverUrl} (status: ${live}) - already running, or belongs to a different server? (not overridable)`,
+      });
+      continue;
+    }
+    // Every caveat a FORCED resume carries, so the report says what was
+    // waived instead of implying a clean resume.
+    const notes: string[] = [];
+    const label = lane.alias ?? lane.sessionID;
+
+    if (live === 'unknown') {
+      if (!force) {
+        outcomes.push({
+          alias: lane.alias,
+          sessionID: lane.sessionID,
+          agent,
+          revived: false,
+          reason: `status could not be read on ${serverUrl}; not prompting blind (--force to try anyway)`,
+        });
+        continue;
+      }
+      deps.err(
+        `Forcing ${label}: its status could not be read on ${serverUrl}, so this resume is blind.`,
+      );
+      notes.push(
+        `status was unreadable on ${serverUrl}; resumed without confirming the lane is idle`,
+      );
+    }
+
+    // MODEL rule, identical to `say`: an unpinned prompt is resolved against
+    // the AGENT's configured model, which would undo a foreground fallback.
+    const pinned = await resolveLaneModel(client, lane.sessionID, directory);
+    if (!pinned) {
+      if (!force) {
+        outcomes.push({
+          alias: lane.alias,
+          sessionID: lane.sessionID,
+          agent,
+          revived: false,
+          reason:
+            'current model could not be established; resuming unpinned could move the lane back onto a model fallback had left (--force to accept that)',
+        });
+        continue;
+      }
+      // Same wording as `say`, because it is the same waiver.
+      deps.err(
+        `Forcing ${label}: its model could not be pinned, so this resume may`,
+      );
+      deps.err("re-pin the lane to its agent's configured model.");
+      notes.push(
+        "model could not be pinned; the lane may have been re-pinned to its agent's configured model",
+      );
+    }
+
+    // Recorded BEFORE the prompt, exactly like `stop`: the plugin sees the
+    // resulting busy signal within milliseconds and needs the explanation to
+    // already be on disk to register the new run and label the record.
+    const intentRecorded = appendLaneIntent(intentsFile, {
+      at: now(),
+      action: 'revive',
+      sessionID: lane.sessionID,
+    });
+
+    let response: LaneSdkResponse;
+    try {
+      response = await client.session.promptAsync({
+        path: { id: lane.sessionID },
+        query: { directory },
+        body: withAgent(
+          {
+            ...(pinned
+              ? {
+                  model: pinned.model,
+                  ...(pinned.variant ? { variant: pinned.variant } : {}),
+                }
+              : {}),
+            parts: [{ type: 'text', text: RESUME_PROMPT_TEXT }],
+          },
+          agent,
+        ),
+      });
+    } catch (error) {
+      outcomes.push({
+        alias: lane.alias,
+        sessionID: lane.sessionID,
+        agent,
+        revived: false,
+        reason: describeSdkError(error),
+      });
+      continue;
+    }
+    if (response?.error) {
+      outcomes.push({
+        alias: lane.alias,
+        sessionID: lane.sessionID,
+        agent,
+        revived: false,
+        reason:
+          response.response?.status === 404
+            ? `session no longer exists on ${serverUrl}; there is nothing to resume into (relaunch the task instead)`
+            : describeSdkError(response.error),
+      });
+      continue;
+    }
+
+    if (!intentRecorded) {
+      notes.push(
+        'the revive could not be recorded: the lane still resumes, but the board keeps showing it as interrupted and the orchestrator is not notified when it finishes',
+      );
+    }
+    outcomes.push({
+      alias: lane.alias,
+      sessionID: lane.sessionID,
+      agent,
+      revived: true,
+      modelPinned: pinned !== undefined,
+      ...(notes.length > 0 ? { notes } : {}),
+    });
+  }
+
+  const revived = outcomes.filter((outcome) => outcome.revived);
+  const skipped = outcomes.filter((outcome) => !outcome.revived);
+
+  if (json) {
+    deps.out(
+      JSON.stringify(
+        {
+          action: 'revive',
+          directory,
+          serverUrl,
+          scope: selector ? 'lane' : cascade ? 'cascade' : 'all',
+          revived,
+          skipped,
+        },
+        null,
+        2,
+      ),
+    );
+    return skipped.length > 0 ? 1 : 0;
+  }
+
+  for (const outcome of skipped) {
+    deps.err(
+      `Skipped ${outcome.alias ?? outcome.sessionID}: ${outcome.reason ?? 'unknown reason'}`,
+    );
+  }
+  if (revived.length === 0) {
+    deps.err('Nothing was revived.');
+    deps.err(
+      'Check "omos lanes list", pass --server, or use --force to override.',
+    );
+    return 1;
+  }
+
+  deps.out(
+    `Revived ${revived.length} lane${revived.length === 1 ? '' : 's'} on ${serverUrl}:`,
+  );
+  for (const outcome of revived) {
+    deps.out(`  ${outcome.alias ?? outcome.sessionID} (${outcome.agent})`);
+    for (const note of outcome.notes ?? []) {
+      deps.out(`    note: ${note}`);
+    }
+  }
+  deps.out('');
+  deps.out(
+    'Each session kept its full history, so the lane continues where it was',
+  );
+  deps.out(
+    'cut off. The orchestrator sees it running again on its next turn, and is',
+  );
+  deps.out('notified when it finishes.');
+  return skipped.length > 0 ? 1 : 0;
 }

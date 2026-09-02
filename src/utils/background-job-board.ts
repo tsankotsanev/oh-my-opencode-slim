@@ -72,6 +72,18 @@ export interface AwaitingPermission {
   permissionID?: string;
 }
 
+/**
+ * Attribution of a lane's death to one orchestrator abort (ESC).
+ *
+ * `at` is the confirmation instant SHARED by every lane of one cascade, which
+ * is what makes the group addressable (`omos lanes revive --cascade`) and
+ * renderable as a single summary line.
+ */
+export interface CascadeStamp {
+  parentSessionID: string;
+  at: number;
+}
+
 export interface BackgroundJobRecord {
   taskID: string;
   parentSessionID: string;
@@ -141,6 +153,33 @@ export interface BackgroundJobRecord {
    * reads, never whether the lane is considered finished.
    */
   cancelledByUser?: { at: number; reason?: string };
+  /**
+   * This lane died to an ESC on the orchestrator, not to anything of its own.
+   *
+   * A LABEL on the record the lifecycle already produced (an aborted child is
+   * `error`), never a state: attribution can only change the wording and the
+   * recovery affordance the orchestrator is shown, never whether the lane is
+   * considered finished. Cleared by the next launch of the same task ID,
+   * because the stamp describes the run that was cut off.
+   */
+  killedByCascade?: CascadeStamp;
+  /**
+   * The user resumed this lane from a second terminal (`omos lanes revive`).
+   *
+   * Also a label, and also only about the CURRENT run: it is set when the
+   * plugin adopts the run the CLI prompted, and cleared by the next launch.
+   */
+  revivedByUser?: { at: number };
+  /**
+   * When an AUTOMATIC restart of this lane was last attempted.
+   *
+   * Deliberately survives kills and relaunches: it exists to rate-limit
+   * `reviveOnCascade: 'auto'` (ESC → revive → ESC → revive would otherwise
+   * loop forever, since each kill opens a fresh cascade with a fresh ledger).
+   * Stamped BEFORE the prompt, so a restart that never produces output still
+   * counts.
+   */
+  lastAutoRevivedAt?: number;
   /** First non-busy runtime observation for the current stop-confirmation grace. */
   stopConfirmationStartedAt?: number;
   completedAt?: number;
@@ -359,6 +398,12 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         lastProgress: undefined,
         awaitingPermission: undefined,
         cancelledByUser: undefined,
+        // Both labels describe the run that just ended, not the one starting
+        // now. `lastAutoRevivedAt` is deliberately NOT reset: it is the
+        // auto-revive cooldown, and clearing it here would reopen the
+        // ESC -> revive -> ESC loop it exists to close.
+        killedByCascade: undefined,
+        revivedByUser: undefined,
         stopConfirmationStartedAt: undefined,
         lastUsedAt: now,
         updatedAt: now,
@@ -784,6 +829,98 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     return updated;
   }
 
+  /**
+   * Attribute an already-`error` lane to an orchestrator abort cascade (ESC).
+   *
+   * Separate from the terminal transition because the two facts arrive in
+   * either order: opencode aborts the CHILD first and the parent ~0.1s later
+   * (probe B1), so the death is normally recorded before there is any evidence
+   * of what caused it, and the stamp has to be applied retroactively.
+   *
+   * Every refusal below is deliberate, because this stamp is what makes a lane
+   * eligible for the bulk affordances and for automatic revival:
+   * - not `error` — an ESC cascade lands as `error` (the abort's
+   *   `session.error`); anything else was not cut off by that abort;
+   * - `deadlineExceededAt` — the wall-clock supervisor aborted this lane on
+   *   purpose;
+   * - `cancellationRequested` — the orchestrator's own cancel path owns this
+   *   outcome (`task_cancel`/`task_revive` under a cancellation lease);
+   * - `cancelledByUser` — the user ended this lane deliberately; a cascade
+   *   label would invite undoing their decision;
+   * - `statusUncertain` — the record does not trust its own reading;
+   * - already stamped — idempotent, and keeps the ORIGINAL `at` so a duplicate
+   *   event cannot split one cascade into two groups.
+   */
+  markCascade(
+    taskID: string,
+    cascade: CascadeStamp,
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (!existing) return undefined;
+    if (existing.state !== 'error') return existing;
+    if (existing.deadlineExceededAt !== undefined) return existing;
+    if (existing.cancellationRequested) return existing;
+    if (existing.cancelledByUser !== undefined) return existing;
+    if (existing.statusUncertain) return existing;
+    if (existing.killedByCascade !== undefined) return existing;
+
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      killedByCascade: {
+        parentSessionID: cascade.parentSessionID,
+        at: cascade.at,
+      },
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /**
+   * Label a lane the user resumed with `omos lanes revive`.
+   *
+   * Applied to the RUNNING record the adoption just created (the CLI prompts,
+   * the plugin registers the new generation), so it describes the live run and
+   * dies with it.
+   */
+  markRevivedByUser(
+    taskID: string,
+    now = Date.now(),
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (!existing) return undefined;
+    if (existing.state !== 'running') return existing;
+    if (existing.revivedByUser !== undefined) return existing;
+
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      revivedByUser: { at: now },
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /**
+   * Stamp "an automatic restart of this lane was just attempted".
+   *
+   * Recorded BEFORE the prompt is sent, so a restart that is accepted but
+   * never produces a busy signal still counts against the cooldown — otherwise
+   * a lane that fails to come back becomes the loop all over again. Applied
+   * whatever the state: the caller is about to change it anyway.
+   */
+  markAutoRevived(
+    taskID: string,
+    now = Date.now(),
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (!existing) return undefined;
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      lastAutoRevivedAt: now,
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
   /** Store partial work from a probe without asserting anything about state. */
   recordProgress(
     taskID: string,
@@ -1005,6 +1142,11 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       recoverableAfterLiveBusy: false,
       statusUncertain: false,
       cancellationRequested: true,
+      // A deliberate cancellation supersedes any ESC attribution: the abort
+      // this record ends on is the one the orchestrator asked for. Reachable
+      // when the child's `session.error` is observed (and provisionally
+      // attributed) before `cancel_task` finishes marking the outcome.
+      killedByCascade: undefined,
       terminalUnreconciled: true,
       updatedAt: now,
       completedAt: existing.completedAt ?? now,
@@ -1382,6 +1524,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         '',
         '#### Active / Unreconciled',
         ...(active.length > 0 ? active.map(formatJob) : ['- none']),
+        ...formatCascadeGroups(active),
         '',
         '#### Reusable Sessions',
         ...(reusable.length > 0
@@ -1612,6 +1755,12 @@ function formatJob(job: BackgroundJobRecord): string {
   const userStop = formatUserStop(job);
   if (userStop) lines.push(...userStop);
 
+  const cascade = formatCascade(job);
+  if (cascade) lines.push(...cascade);
+
+  const revived = formatRevivedByUser(job);
+  if (revived) lines.push(revived);
+
   const lastSeen = formatLastSeen(job);
   if (lastSeen) lines.push(lastSeen);
 
@@ -1650,6 +1799,78 @@ function formatUserStop(job: BackgroundJobRecord): string[] | undefined {
     `  Stopped by: the user, from a second terminal (omos lanes stop)${reason}`,
     '  Action: treat this as a user cancellation - do not relaunch it unasked; its session is intact, so task_revive(task_id) resumes it if the user asks.',
   ];
+}
+
+/**
+ * Why this lane is dead: ESC on the orchestrator, not anything of its own.
+ *
+ * The Action is the whole point of the attribution. Without it an ESC cascade
+ * reads as N independent anonymous failures, and the orchestrator's cheapest
+ * next move looks like relaunching N tasks from scratch — when every session
+ * is intact and resumable in place, for free, from the user's other terminal.
+ *
+ * Suppressed once the user has deliberately stopped the lane: `formatUserStop`
+ * has already said "do not relaunch it unasked", and that instruction outranks
+ * a recovery affordance.
+ */
+function formatCascade(job: BackgroundJobRecord): string[] | undefined {
+  if (job.killedByCascade === undefined) return undefined;
+  // Only the record shape an ESC actually produces. Anything else carrying a
+  // stamp got there through a race with a deliberate outcome, and that outcome
+  // is the one worth reading.
+  if (job.state !== 'error') return undefined;
+  if (job.cancelledByUser !== undefined) return undefined;
+  return [
+    '  Interrupted by: ESC on the orchestrator (one abort kills every lane)',
+    `  Action: interrupted by ESC on the orchestrator; session intact - resume via task_revive or \`omos lanes revive ${promptSafe(
+      job.alias,
+    )}\``,
+  ];
+}
+
+/** A lane the user resumed themselves, so the parent knows why it is back. */
+function formatRevivedByUser(job: BackgroundJobRecord): string | undefined {
+  if (job.state !== 'running' || job.revivedByUser === undefined) {
+    return undefined;
+  }
+  return '  Resumed by: the user, from a second terminal (omos lanes revive)';
+}
+
+/**
+ * One line per cascade, for the cascades that took more than one lane.
+ *
+ * A group of N identical per-lane Actions does not communicate the one fact
+ * that matters — that these deaths are ONE event with ONE recovery command.
+ * Single-lane cascades are already fully described by their own Action line,
+ * so they get no summary.
+ *
+ * Render-pure: no ages, no timestamps, nothing derived from `now`, so an
+ * unchanged board renders byte-identically on every injection.
+ */
+function formatCascadeGroups(jobs: BackgroundJobRecord[]): string[] {
+  const groups = new Map<number, BackgroundJobRecord[]>();
+  for (const job of jobs) {
+    const at = job.killedByCascade?.at;
+    if (at === undefined || job.state !== 'error') continue;
+    if (job.cancelledByUser !== undefined) continue;
+    const bucket = groups.get(at) ?? [];
+    bucket.push(job);
+    groups.set(at, bucket);
+  }
+
+  const lines: string[] = [];
+  for (const at of [...groups.keys()].sort((a, b) => a - b)) {
+    const bucket = groups.get(at) as BackgroundJobRecord[];
+    if (bucket.length < 2) continue;
+    lines.push(
+      `- ${bucket.length} lanes were interrupted together by one ESC on the orchestrator (${bucket
+        .map((job) => promptSafe(job.alias))
+        .join(
+          ', ',
+        )}); every session is intact. Resume them all with \`omos lanes revive --cascade\`, or one at a time with task_revive.`,
+    );
+  }
+  return lines;
 }
 
 /**

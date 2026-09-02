@@ -669,10 +669,15 @@ omos lanes say fix-1 "also update the codemap"
 omos lanes stop ora-2 --reason "wrong file set"
 ```
 
+```bash
+omos lanes revive --cascade             # resume the lanes the last ESC killed
+omos lanes revive fix-1                 # resume one lane in its own session
+```
+
 Options: `--dir <path>` (project, default cwd), `--server <url>`,
-`-n/--count`, `--reason`, `--force`, `--json`. Reviving a lane is not in the
-CLI yet — ask the orchestrator for `task_revive`, which resumes a stopped lane
-in its own session.
+`-n/--count`, `--reason`, `--cascade`/`--all` (revive only), `--force`,
+`--json`. See [ESC and recovery](#esc-and-recovery) for what `revive` does and
+when it refuses.
 
 **How it finds things.** With `backgroundJobs.laneControl` on (the default) the
 plugin writes two files per project under
@@ -683,7 +688,7 @@ by `sha256(canonical project dir)[:16]`:
 |---|---|---|---|
 | `<key>.json` | plugin | CLI | lane list (alias, agent, state, objective, `Last seen`, permission stamp) |
 | `<key>.server.json` | plugin | CLI | which server owns this directory (url, pid, heartbeat) |
-| `<key>.intents.jsonl` | CLI | plugin | why a lane was just stopped |
+| `<key>.intents.jsonl` | CLI | plugin | why a lane was just stopped, or that a busy signal is a resume you asked for |
 
 The direction of each arrow is a hard rule, and one of them deserves emphasis:
 
@@ -714,7 +719,7 @@ the agent rule.
 | `say` to a `running` lane that is not busy *here* | Refused: prompting it could start a second concurrent turn on a session another server is mid-turn in (corruption class) | Sends anyway |
 | `say` to a `running, status uncertain` lane | Warned, then sent — an idle reading is exactly what that flag means | Sends without the check |
 | `say` to a `running` lane whose cancellation the orchestrator owns (`cancellationRequested`) | **Refused, never forceable**: a prompt racing an in-flight abort is guaranteed to disagree with it | still refused |
-| `say` to a `stopped`/`error` lane | Refused: the session exists, but no reply will reach the orchestrator — ask it for `task_revive` instead | Sent with `noReply`, so the text is left in the transcript as a note for whoever resumes the lane, without starting a turn |
+| `say` to a `stopped`/`error` lane | Refused: the session exists, but no reply will reach the orchestrator — `omos lanes revive` it (or ask for `task_revive`) instead | Sent with `noReply`, so the text is left in the transcript as a note for whoever resumes the lane, without starting a turn |
 | `say` to a `completed`/`cancelled`/`reconciled` lane | Refused: it already produced its result | Same as above — a note, not a turn |
 | `say` with no recorded agent | **Refused, never forceable**: a prompt without the session's own `agent` permanently rewrites that session to the default `build` agent | still refused |
 | `say` when the lane's current model cannot be established | Refused, exactly as `task_message` does — see below | Sends unpinned, and says that the lane may be re-pinned to its agent's configured model |
@@ -731,7 +736,11 @@ cancellation lease) is never relabelled. Intent lines are claimed once, expire
 after 60s for attribution, and are pruned after 10 minutes.
 
 `stop` also verifies rather than assumes: an accepted abort that does not leave
-the session idle within 5s exits 1 and says so.
+the session idle within 5s exits 1 and says so. Its "the orchestrator will see
+this on its next turn" is free for a first-generation lane (the board is
+injected into a turn the model was taking anyway); a lane that had been REVIVED
+is tracked by the revived-run tracker, which synthesizes a `<task>` notification
+and therefore does start one short turn.
 
 **`say` pins two identities, not one.** Passing the lane's own `agent` is the
 better-known rule (probe A2: omit it and the session is rewritten to `build`),
@@ -764,6 +773,121 @@ same alias the board, `omos lanes` and `task_message` use.
 Turning this off (`backgroundJobs.laneControl: false`) stops all three files
 from being written or read; `omos lanes list` then explains that the mirror is
 missing, and orchestration is otherwise unaffected.
+
+### ESC and recovery
+
+**What ESC does.** Pressing ESC in the TUI aborts the orchestrator session, and
+OpenCode's abort cascades to the **whole session tree**: every background lane
+the orchestrator owns dies with it. This happens from a busy parent *and* from
+an idle one (probes B1/B3 in `docs/agents/subagent-probe-results.md`), it emits
+no `session.deleted`, and the plugin cannot prevent it — it observes events, it
+does not own the abort.
+
+What survives is everything that matters: each lane's **session is intact**, so
+it can be resumed in place with its full history, plan and tool log still in
+context. What is missing from the raw events is the *cause* — an abort carries
+none, so "the user pressed ESC" and "something aborted this one lane" arrive as
+byte-identical events. The plugin reconstructs it.
+
+**Attribution.** A child abort that nobody asked for becomes a *candidate*; a
+later orchestrator abort or idle confirms the group. The rules, and why each
+threshold exists:
+
+| Evidence | Attributed? | Why |
+|---|---|---|
+| Orchestrator `session.error(MessageAbortedError)` within 3s of the death (before or after) | **Yes**, even for one lane | Probe B1: the parent's own abort is unambiguous. The children are aborted ~0.1s FIRST, so the window looks backwards as well as forwards |
+| Parent went idle, and it was **already idle** when the lane died | **Yes**, one lane is enough | Probe B3: an idle parent that emits another idle has no other reason to. This is the realistic background topology |
+| Parent was **busy** when the lane died, then went idle | Only with **two or more** sibling deaths in the window | Probe B2: a parent goes idle ~0.7s after an unrelated single-lane abort simply because its own turn ended |
+| Parent liveness never observed | Treated as **busy** (two-lane rule) | Fail closed |
+| Parent idled BEFORE the only death | **No** | That is the reverse of the B3 ordering, and not a cascade at all |
+| The lane had a `omos lanes stop` intent, an orchestrator `task_cancel`, a wall-clock timeout, or a foreground-fallback abort | **Never** | Those deaths are already explained; a fallback abort is the plugin's own |
+
+Attribution is a **label on the `error` record** (`killedByCascade`), never a
+new state, and it is dropped if a deliberate cancellation lands afterwards. An
+unattributed lane loses nothing except the group affordances: it is still
+`error`, still says its session is intact, and is still revivable by name.
+
+The board then reads, per lane, and once per group of two or more:
+
+```text
+- fix-1 / ses_… / fixer / error, unreconciled
+  Objective: fix the parser
+  Interrupted by: ESC on the orchestrator (one abort kills every lane)
+  Action: interrupted by ESC on the orchestrator; session intact - resume via task_revive or `omos lanes revive fix-1`
+- 3 lanes were interrupted together by one ESC on the orchestrator (fix-1, exp-1, ora-1); every session is intact. Resume them all with `omos lanes revive --cascade`, or one at a time with task_revive.
+```
+
+> **Known false positive.** Two per-pane ESCs on sibling lanes within three
+> seconds, while their parent happens to finish its turn, produce exactly the
+> evidence of one ESC on the parent. In the default `off` mode the consequence
+> is a wrong label; in `auto` it is an unwanted restart, undone with `omos lanes
+> stop`. Nested lanes (a lane that launched lanes) are only attributed through
+> the parent-abort path, because no liveness is tracked for a non-orchestrator
+> parent.
+
+**Recovering by hand.** From the second terminal, at zero orchestrator turns:
+
+```bash
+omos lanes revive --cascade        # the lanes the last ESC killed
+omos lanes revive fix-1            # one lane, by alias
+omos lanes revive --all            # every interrupted lane in this project
+```
+
+`revive` performs the same operation `task_revive` does, and that is the point:
+it resumes the lane **in its own session** (never a new one), writes a `revive`
+intent before prompting, and the plugin claims that line when the resulting busy
+signal arrives to register a new run generation with the revived-run tracker. So
+the orchestrator is notified with a `<task>` result when the resumed lane
+finishes, exactly as if it had run `task_revive` itself — which matters, because
+nothing else ever tells it (probe B2).
+
+Both identities are pinned on the resume prompt, or the command refuses: the
+lane's own `agent` (omitting it rewrites the session to `build`) and its live
+`model` (omitting it re-pins the lane to the agent's configured model and undoes
+a foreground-fallback failover). The prompt itself is deliberately minimal — the
+session still has everything — except for the one thing the lane cannot know:
+
+> You were interrupted by an abort. Continue your original task from where you
+> left off; your earlier instructions still stand. Before repeating any file
+> edit or command you were in the middle of, re-check its current state first.
+> Finish with the same final report format.
+
+| Situation | `revive` behaviour |
+|---|---|
+| Lane is `busy`/`retry` on this server | **Refused, never forceable**: it was already revived, or it lives on another server and prompting here starts a second concurrent turn |
+| Status unreadable | Refused (`--force` proceeds) — no prompting blind |
+| Session returns 404 | Reported as gone: there is nothing to resume into, relaunch the task instead |
+| Lane you stopped yourself | Excluded from `--cascade`/`--all`; revivable by explicit alias, which is the reversal of your own decision |
+| Lane that finished normally | Refused: the resume text would be a lie; ask the orchestrator for `task_revive` with a real follow-up prompt |
+| Selector is an orchestrator session | Refused, like `stop`/`say` — aborting it kills every lane |
+| No recorded agent, or model unestablished | Refused (agent never forceable; model forceable with a warning) |
+
+**Recovering automatically (experimental).** `backgroundJobs.reviveOnCascade:
+"auto"` resumes the attributed lanes by itself, 13 seconds after the cascade,
+through the same machinery. It is **off by default** and marked EXPERIMENTAL,
+because a wrong attribution here restarts work instead of merely mislabelling
+it. Four gestures keep ESC a panic button:
+
+1. **the delay** — 3s window + 10s grace before anything moves;
+2. **`omos lanes stop`** — after a cascade the lane is already dead and idle, so
+   `stop` records the cancellation instead of aborting, and auto-revive claims
+   that intent immediately before prompting and skips the lane (labelling it as
+   your cancellation);
+3. **a second ESC** — an orchestrator abort that opens a new cascade cancels the
+   pending restarts of the earlier one. Pressing ESC twice means it;
+4. **a 10-minute per-lane cooldown** — cancelling timers is not enough on its
+   own, because a re-killed lane belongs to a *new* cascade; the cooldown is
+   what closes the ESC → revive → ESC loop. It survives kills and relaunches,
+   and it never applies to an explicit `omos lanes revive`.
+
+On top of those, auto-revive takes one live status read and touches only lanes
+that are positively idle, never a lane whose cancellation the orchestrator owns,
+and at most once per lane per cascade — the attempt is stamped *before* the
+prompt, so a restart that never comes back is not retried.
+
+The wake scheduler is deliberately not involved: it wakes an idle orchestrator
+on its own schedule, and gating it on lane state was rejected — recovery here is
+about the lanes, not about interrupting the parent.
 
 ---
 

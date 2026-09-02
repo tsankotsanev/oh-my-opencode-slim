@@ -46,9 +46,11 @@ import path from 'node:path';
 import type {
   BackgroundJobRecord,
   BackgroundJobState,
+  CascadeStamp,
   LaneProgress,
 } from './background-job-board';
 import { log } from './logger';
+import type { TaskOutputState } from './task';
 
 /** Bumped whenever a field the CLI relies on changes meaning. */
 export const LANE_MIRROR_VERSION = 1;
@@ -98,6 +100,25 @@ export interface LaneMirrorRecord {
   awaitingPermission?: { tool: string; at: number };
   /** Set when a `omos lanes stop` was attributed to this lane's abort. */
   cancelledByUser?: { at: number; reason?: string };
+  /**
+   * Set when this lane's death was attributed to an ESC on the orchestrator.
+   *
+   * Published whole rather than as a boolean because `at` is the cascade's
+   * identity: `omos lanes revive --cascade` selects the group with the newest
+   * `at`, which is the only way "undo the ESC I just pressed" can be expressed
+   * offline.
+   */
+  killedByCascade?: CascadeStamp;
+  /** Set while the current run is one the user resumed from the CLI. */
+  revivedByUser?: { at: number };
+  /**
+   * Outcome carried by a `reconciled` record.
+   *
+   * Published so the CLI's revivability check (`isReviveableRetainedJob`) can
+   * be the SAME predicate `task_revive` applies, rather than a lookalike that
+   * silently disagrees about reconciled lanes.
+   */
+  terminalState?: TaskOutputState;
   launchedAt: number;
   updatedAt: number;
 }
@@ -234,6 +255,9 @@ export function toLaneMirrorRecord(job: BackgroundJobRecord): LaneMirrorRecord {
         }
       : {}),
     ...(job.cancelledByUser ? { cancelledByUser: job.cancelledByUser } : {}),
+    ...(job.killedByCascade ? { killedByCascade: job.killedByCascade } : {}),
+    ...(job.revivedByUser ? { revivedByUser: job.revivedByUser } : {}),
+    ...(job.terminalState ? { terminalState: job.terminalState } : {}),
     launchedAt: job.launchedAt,
     updatedAt: job.updatedAt,
   };

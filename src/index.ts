@@ -482,6 +482,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // `omos lanes` control channel. Passed explicitly: the hook defaults it
       // off so no test or embedded construction writes to the data dir.
       laneControl: runtime.backgroundJobs.laneControl,
+      // EXPERIMENTAL automatic resume of the lanes one ESC killed. Attribution
+      // runs regardless; this only decides whether anything is restarted.
+      reviveOnCascade: runtime.backgroundJobs.reviveOnCascade,
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
       backgroundTaskConcurrency,

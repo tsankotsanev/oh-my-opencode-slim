@@ -7,6 +7,7 @@ import type {
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
 import { getClient } from '../../utils/opencode-client';
+import { sessionErrorMessage } from '../../utils/session-error';
 import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
 
 const DEFAULT_NOTIFICATION_RETRIES = 3;
@@ -190,7 +191,13 @@ export function createRevivedRunTracker(options: {
     }
     if (hasPendingToolCall(data, baselineIndex)) return false;
     if (last.info.error !== undefined) {
-      const result = errorText(last.info.error);
+      // The SDK error shape is `{ name, data: { message } }`, so serializing it
+      // whole put raw JSON in front of the orchestrator where a sentence
+      // belongs (`Aborted`, `provider failed`).
+      const result = sessionErrorMessage(
+        last.info.error,
+        'Revived child session failed.',
+      );
       const updated = options.backgroundJobBoard.updateStatus({
         taskID: run.taskID,
         expectedGeneration: run.generation,
@@ -296,16 +303,11 @@ export function createRevivedRunTracker(options: {
       }
       const state = record.state === 'completed' ? 'completed' : 'error';
       const tag = state === 'completed' ? 'task_result' : 'task_error';
-      const summary =
-        state === 'completed'
-          ? `Background task completed: ${run.description}`
-          : `Background task failed: ${run.description}`;
       const text = [
         `<task id="${run.taskID}" state="${state}">`,
-        `<summary>${summary}</summary>`,
+        `<summary>${terminalSummary(run.description, record, state)}</summary>`,
         `<${tag}>`,
-        record.resultSummary ??
-          (state === 'completed' ? 'Completed.' : 'Failed.'),
+        ...terminalBody(record, state),
         `</${tag}>`,
         '</task>',
       ].join('\n');
@@ -457,6 +459,69 @@ class NotificationTransportTimeoutError extends Error {
     super('Parent terminal notification transport timed out');
     this.name = 'NotificationTransportTimeoutError';
   }
+}
+
+/**
+ * What the parent is told this run's outcome WAS.
+ *
+ * Upstream's two shapes (`completed` / `failed`) are right for a run that ran
+ * and ended. They are actively wrong for the two ways a lane dies without
+ * failing at anything, and both are reachable on a revived run:
+ *
+ *   - the user stopped it from a second terminal (`omos lanes stop`), which
+ *     lands as an aborted `error` record. "Background task failed: Session
+ *     error" invites the orchestrator to diagnose and retry a task the human
+ *     deliberately ended;
+ *   - ESC on the orchestrator, whose abort cascades to every lane. Same
+ *     wording problem, N times over, for deaths that share one cause and one
+ *     one-command recovery.
+ *
+ * Both are LABELS on the record (`cancelledByUser`, `killedByCascade`): the
+ * state stays whatever the lifecycle recorded, so this only changes what the
+ * parent reads, never what the board considers finished.
+ */
+function terminalSummary(
+  description: string,
+  record: BackgroundJobRecord,
+  state: 'completed' | 'error',
+): string {
+  if (state === 'completed') return `Background task completed: ${description}`;
+  const stop = record.cancelledByUser;
+  if (stop) {
+    const reason = stop.reason ? ` (${stop.reason})` : '';
+    return `Background task stopped by the user (omos lanes stop): ${description}${reason}`;
+  }
+  if (record.killedByCascade) {
+    return `Background task interrupted by ESC on the orchestrator: ${description}`;
+  }
+  return `Background task failed: ${description}`;
+}
+
+/** Body of the notification: the cause first, then whatever was recorded. */
+function terminalBody(
+  record: BackgroundJobRecord,
+  state: 'completed' | 'error',
+): string[] {
+  const recorded =
+    record.resultSummary ?? (state === 'completed' ? 'Completed.' : 'Failed.');
+  if (state === 'completed') return [recorded];
+
+  const stop = record.cancelledByUser;
+  if (stop) {
+    return [
+      `The user stopped this lane from a second terminal${
+        stop.reason ? `: ${stop.reason}` : ''
+      }. Treat it as a cancellation - do not relaunch it unasked; its session is intact, so task_revive(task_id) resumes it if the user asks.`,
+      recorded,
+    ];
+  }
+  if (record.killedByCascade) {
+    return [
+      'This lane was interrupted by ESC on the orchestrator, which aborts every lane at once. It did not fail: its session is intact and task_revive(task_id) resumes it in place.',
+      recorded,
+    ];
+  }
+  return [recorded];
 }
 
 function terminalOutcome(

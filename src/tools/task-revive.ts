@@ -1,11 +1,26 @@
 import { type ToolDefinition, tool } from '@opencode-ai/plugin';
+import { launchRetainedRun } from '../hooks/task-session-manager/revive-run';
 import type { RevivedRunTracker } from '../hooks/task-session-manager/revived-run-tracker';
 import type { BackgroundJobSupervisor } from '../utils/background-job-supervisor';
+import { isReviveableRetainedJob } from '../utils/lane-state';
 import { getClient } from '../utils/opencode-client';
 import {
   cancelTrackedExecution,
   type TaskControlToolOptions,
 } from './cancel-task';
+
+/**
+ * Whether a retained record may be revived in place.
+ *
+ * Re-exported (not re-implemented) from `src/utils/lane-state.ts`, which is
+ * the copy `omos lanes revive` and the plugin's cascade auto-revive also use:
+ * three callers disagreeing about what "revivable" means is the one bug none
+ * of them would notice. Kept on this module's surface because tests assert a
+ * specific terminal record stays revivable through the tool — notably a child
+ * whose transport died, which is recorded as `error` precisely so this
+ * predicate accepts it.
+ */
+export { isReviveableRetainedJob } from '../utils/lane-state';
 
 const z = tool.schema;
 
@@ -73,76 +88,56 @@ export function createTaskReviveTool(
         );
       }
 
-      const relaunchLease = options.backgroundJobBoard.acquireRelaunchLease(
-        current.taskID,
-        current.generation,
-      );
-      if (!relaunchLease) {
-        throw new Error(
-          `Task ${requested} cannot be revived: relaunch lease unavailable`,
-        );
-      }
-
-      let baselineMessageID: string | undefined;
+      // The relaunch mechanism itself (lease, baseline fence, new generation,
+      // tracker registration, supervisor, immediate probe) is shared with the
+      // plugin's own revive paths — see `revive-run.ts`. Only the prompt body
+      // and the wording stay here.
       let launched:
         | ReturnType<
             TaskControlToolOptions['backgroundJobBoard']['registerLaunch']
           >
         | undefined;
       try {
-        baselineMessageID = await revivedRunTracker.captureBaseline(
-          current.taskID,
-        );
-        const session = getClient(options.input).session;
-        if (typeof session.promptAsync !== 'function') {
-          throw new Error('The host session does not support promptAsync');
-        }
-        const response = await session.promptAsync({
-          path: { id: current.taskID },
-          query: { directory: options.input.directory },
-          body: {
-            agent: current.agent,
-            parts: [{ type: 'text', text: prompt }],
+        launched = await launchRetainedRun(
+          {
+            input: options.input,
+            backgroundJobBoard: options.backgroundJobBoard,
+            backgroundJobSupervisor: options.backgroundJobSupervisor,
+            revivedRunTracker,
           },
-        });
-        const responseError = getApiError(response);
-        if (responseError !== undefined) {
-          throw new Error(errorText(responseError));
-        }
-
-        launched = options.backgroundJobBoard.registerLaunch({
-          taskID: current.taskID,
-          parentSessionID,
-          agent: current.agent,
-          description: current.description,
-          objective: current.objective,
-          background: true,
-          relaunchLease,
-        });
-        if (launched.generation <= current.generation) {
-          throw new Error(`Task ${requested} did not receive a new generation`);
-        }
-        revivedRunTracker.register({
-          taskID: launched.taskID,
-          generation: launched.generation,
-          parentSessionID,
-          baselineMessageID,
-          description: launched.description,
-        });
-        options.backgroundJobSupervisor?.onLaunch(launched);
-        await revivedRunTracker.probe(launched.taskID, launched.generation);
+          {
+            record: current,
+            label: 'task_revive',
+            sendPrompt: async () => {
+              const session = getClient(options.input).session;
+              if (typeof session.promptAsync !== 'function') {
+                throw new Error(
+                  'The host session does not support promptAsync',
+                );
+              }
+              const response = await session.promptAsync({
+                path: { id: current.taskID },
+                query: { directory: options.input.directory },
+                body: {
+                  agent: current.agent,
+                  parts: [{ type: 'text', text: prompt }],
+                },
+              });
+              const responseError = getApiError(response);
+              if (responseError !== undefined) {
+                throw new Error(errorText(responseError));
+              }
+            },
+          },
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (launched) {
-          options.backgroundJobBoard.markStatusUncertain(
-            current.taskID,
-            `task_revive failed: ${message}`,
-            launched.generation,
+        if (message === 'relaunch lease unavailable') {
+          throw new Error(
+            `Task ${requested} cannot be revived: relaunch lease unavailable`,
           );
         }
         throw new Error(`Task ${requested} revive failed: ${message}`);
-      } finally {
-        options.backgroundJobBoard.releaseLease(relaunchLease);
       }
 
       if (!launched) {
@@ -206,28 +201,6 @@ function getCurrentReviveJob(
     );
   }
   return current;
-}
-
-/**
- * Whether a retained (non-cancelled-for-revive) record may be revived in
- * place. Exported for tests that assert a specific terminal record stays
- * revivable — notably a child whose transport died, which is recorded as
- * `error` precisely so this predicate accepts it.
- */
-export function isReviveableRetainedJob(
-  job: NonNullable<
-    ReturnType<TaskReviveToolOptions['backgroundJobBoard']['get']>
-  >,
-): boolean {
-  if (job.statusUncertain) return false;
-  if (
-    job.state === 'completed' ||
-    job.state === 'error' ||
-    job.state === 'cancelled'
-  ) {
-    return true;
-  }
-  return job.state === 'reconciled' && job.terminalState !== undefined;
 }
 
 function assertOrchestrator(

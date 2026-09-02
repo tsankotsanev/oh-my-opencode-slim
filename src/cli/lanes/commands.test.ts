@@ -80,6 +80,8 @@ interface LaneSeed {
    */
   cancellationRequested?: boolean;
   permissionTool?: string;
+  /** Attribute the lane to an ESC cascade confirmed at this instant. */
+  cascadeAt?: number;
 }
 
 /**
@@ -150,6 +152,12 @@ function seedLanes(lanes: LaneSeed[] = [{}], directory = projectDir): void {
             lane.state === 'error' ? 'MessageAbortedError' : 'all done',
         });
         break;
+    }
+    if (lane.cascadeAt !== undefined) {
+      board.markCascade(taskID, {
+        parentSessionID: lane.parentSessionID ?? 'ses_parent',
+        at: lane.cascadeAt,
+      });
     }
     if (lane.cancelledByUser) {
       board.markCancelledByUser(
@@ -1152,5 +1160,270 @@ describe('runLanesCommand', () => {
     );
     expect(code).toBe(1);
     expect(h.stderr()).toContain('boom');
+  });
+});
+
+// ── revive ────────────────────────────────────────────────────────────
+
+describe('omos lanes revive', () => {
+  const RESUME_START = 'You were interrupted by an abort.';
+
+  function reviveIntents(): ReturnType<typeof readLaneIntents> {
+    return readLaneIntents(laneIntentsPath(projectDir), { now: NOW }).filter(
+      (intent) => intent.action === 'revive',
+    );
+  }
+
+  test('resumes an interrupted lane with its own agent AND model pinned', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const result = await run(['revive', 'fix-1']);
+
+    expect(result.code).toBe(0);
+    const body = (
+      result.calls.promptAsync[0] as { body: Record<string, unknown> }
+    ).body;
+    // A2: without the agent the server rewrites the session to `build`.
+    expect(body.agent).toBe('fixer');
+    // MODEL rule: without it, core resolves the AGENT's configured model and
+    // silently undoes a foreground-fallback failover.
+    expect(body.model).toEqual(PINNED_MODEL);
+    expect(body.parts).toEqual([
+      { type: 'text', text: expect.stringContaining(RESUME_START) },
+    ]);
+    // The intent is what lets the plugin register the new run with the
+    // revived-run tracker, so the orchestrator is told when it finishes.
+    expect(reviveIntents()).toMatchObject([
+      { action: 'revive', sessionID: 'ses_child1' },
+    ]);
+    expect(result.stdout()).toContain('Revived 1 lane');
+  });
+
+  test('refuses a busy lane even with --force, and prompts nothing', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const result = await run(['revive', 'fix-1', '--force'], {
+      statuses: [{ ses_child1: { type: 'busy' } }],
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr()).toContain('not idle');
+    expect(result.stderr()).toContain('not overridable');
+    expect(result.calls.promptAsync).toHaveLength(0);
+    expect(reviveIntents()).toHaveLength(0);
+  });
+
+  test('refuses a lane that was never interrupted, unless forced', async () => {
+    seedLanes([{ state: 'running' }]);
+    seedSidecar();
+
+    const refused = await run(['revive', 'fix-1']);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr()).toContain('Refusing to revive fix-1');
+    expect(refused.calls.promptAsync).toHaveLength(0);
+  });
+
+  test('refuses a lane that finished: the resume prompt would be a lie', async () => {
+    seedLanes([{ state: 'completed' }]);
+    seedSidecar();
+
+    const result = await run(['revive', 'fix-1']);
+    expect(result.code).toBe(1);
+    expect(result.stderr()).toContain('it finished normally');
+    expect(result.stderr()).toContain('task_revive');
+  });
+
+  test('an acknowledged (reconciled) ESC death is still revivable', async () => {
+    // The orchestrator taking one turn moves the record from `error` to
+    // `reconciled` - it is the same interrupted lane, and --cascade must not
+    // quietly stop finding it.
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'ses_parent',
+      agent: 'fixer',
+      description: 'fix the parser',
+      background: true,
+      now: NOW - 60_000,
+    });
+    board.updateStatus({ taskID: 'ses_child1', state: 'error' });
+    board.markCascade('ses_child1', {
+      parentSessionID: 'ses_parent',
+      at: NOW - 10_000,
+    });
+    board.markReconciled('ses_child1');
+    createLaneMirror({
+      directory: projectDir,
+      enabled: true,
+      lanes: () => board.list(),
+      now: () => NOW - 500,
+    }).flushNow();
+    seedSidecar();
+
+    const result = await run(['revive', '--cascade', '--json']);
+    expect(
+      (result.json() as { revived: Array<{ sessionID: string }> }).revived,
+    ).toHaveLength(1);
+  });
+
+  test('an unreadable status is not prompted blind, but --force may', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const blind = await run(['revive', 'fix-1'], {
+      statuses: [{ ses_child1: { type: 'weird-shape' } } as never],
+    });
+    expect(blind.code).toBe(1);
+    expect(blind.stderr()).toContain('not prompting blind');
+
+    const forced = await run(['revive', 'fix-1', '--force'], {
+      statuses: [{ ses_child1: { type: 'weird-shape' } } as never],
+    });
+    expect(forced.code).toBe(0);
+    expect(forced.calls.promptAsync).toHaveLength(1);
+  });
+
+  test('--cascade takes the LATEST group only', async () => {
+    seedLanes([
+      { state: 'error', cascadeAt: NOW - 500_000 },
+      { state: 'error', cascadeAt: NOW - 10_000, agent: 'explorer' },
+      { state: 'error', cascadeAt: NOW - 10_000, agent: 'oracle' },
+      { state: 'error' },
+    ]);
+    seedSidecar();
+
+    const result = await run(['revive', '--cascade', '--json']);
+
+    const payload = result.json() as {
+      revived: Array<{ sessionID: string }>;
+      scope: string;
+    };
+    expect(payload.scope).toBe('cascade');
+    expect(payload.revived.map((entry) => entry.sessionID)).toEqual([
+      'ses_child2',
+      'ses_child3',
+    ]);
+  });
+
+  test('--cascade says so when nothing is attributed to an ESC', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const result = await run(['revive', '--cascade']);
+    expect(result.code).toBe(0);
+    expect(result.stdout()).toContain('none is attributed to an ESC cascade');
+    expect(result.calls.promptAsync).toHaveLength(0);
+  });
+
+  test('a lane you stopped yourself is excluded from --all but revivable by name', async () => {
+    seedLanes([
+      { state: 'error', cancelledByUser: 'I meant it' },
+      { state: 'error', agent: 'explorer' },
+    ]);
+    seedSidecar();
+
+    const bulk = await run(['revive', '--all', '--json']);
+    expect(
+      (bulk.json() as { revived: Array<{ sessionID: string }> }).revived.map(
+        (entry) => entry.sessionID,
+      ),
+    ).toEqual(['ses_child2']);
+
+    const named = await run(['revive', 'fix-1']);
+    expect(named.code).toBe(0);
+    expect(named.calls.promptAsync).toHaveLength(1);
+  });
+
+  test('a session that no longer exists is reported, not retried', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const result = await run(['revive', 'fix-1'], {
+      promptAsync: () => ({
+        error: { message: 'not found' },
+        response: { status: 404 } as Response,
+      }),
+    });
+
+    expect(result.code).toBe(1);
+    expect(result.stderr()).toContain('session no longer exists');
+    expect(result.stderr()).toContain('relaunch the task instead');
+  });
+
+  test('refuses an orchestrator session id, which would kill every lane', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const result = await run(['revive', 'ses_parent']);
+    expect(result.code).toBe(1);
+    expect(result.stderr()).toContain('is an orchestrator session');
+    expect(result.calls.promptAsync).toHaveLength(0);
+  });
+
+  test('refuses to resume unpinned when the model cannot be established', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const spec = { get: { data: { parentID: 'ses_parent' } } } as ClientSpec;
+    const refused = await run(['revive', 'fix-1'], spec);
+    expect(refused.code).toBe(1);
+    expect(refused.stderr()).toContain(
+      'current model could not be established',
+    );
+    expect(refused.calls.promptAsync).toHaveLength(0);
+
+    const forced = await run(['revive', 'fix-1', '--force'], spec);
+    expect(forced.code).toBe(0);
+    const body = (
+      forced.calls.promptAsync[0] as { body: Record<string, unknown> }
+    ).body;
+    expect(body.model).toBeUndefined();
+    expect(body.agent).toBe('fixer');
+  });
+
+  /**
+   * `--force` is an override, not an absolution. A forced resume that reports a
+   * bare "Revived 1 lane" hides exactly the facts the user needs to judge it,
+   * and `say` already sets the precedent of naming every waiver out loud.
+   */
+  test('a forced resume names what it overrode, in the report and in --json', async () => {
+    seedLanes([{ state: 'error' }]);
+    seedSidecar();
+
+    const forced = await run(['revive', 'fix-1', '--force'], {
+      // Unreadable status AND an unpinnable model: both waivers at once.
+      statuses: [{ ses_child1: { type: 'weird-shape' } } as never],
+      get: { data: { parentID: 'ses_parent' } },
+    });
+
+    expect(forced.code).toBe(0);
+    expect(forced.stderr()).toContain('this resume is blind');
+    expect(forced.stderr()).toContain('model could not be pinned');
+    expect(forced.stdout()).toContain('note: status was unreadable');
+    expect(forced.stdout()).toContain('note: model could not be pinned');
+
+    const asJson = await run(['revive', 'fix-1', '--force', '--json'], {
+      statuses: [{ ses_child1: { type: 'weird-shape' } } as never],
+      get: { data: { parentID: 'ses_parent' } },
+    });
+    const payload = asJson.json() as {
+      revived: Array<{ modelPinned: boolean; notes: string[] }>;
+    };
+    expect(payload.revived[0]?.modelPinned).toBe(false);
+    expect(payload.revived[0]?.notes).toHaveLength(2);
+  });
+
+  test('forcing past a board-state refusal says what it overrode', async () => {
+    seedLanes([{ state: 'completed' }]);
+    seedSidecar();
+
+    const forced = await run(['revive', 'fix-1', '--force']);
+
+    expect(forced.code).toBe(0);
+    expect(forced.stderr()).toContain('Forcing fix-1');
+    expect(forced.stderr()).toContain('it finished normally');
+    expect(forced.calls.promptAsync).toHaveLength(1);
   });
 });

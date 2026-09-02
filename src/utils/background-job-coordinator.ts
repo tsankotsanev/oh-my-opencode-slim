@@ -5,6 +5,7 @@ import type {
   BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
+  CascadeStamp,
   ContextFile,
   LaneProgress,
   WallClockTimeoutClaimInput,
@@ -299,6 +300,27 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     now = Date.now(),
   ): BackgroundJobRecord | undefined {
     return this.board.markCancelledByUser(taskID, reason, now);
+  }
+
+  markCascade(
+    taskID: string,
+    cascade: CascadeStamp,
+  ): BackgroundJobRecord | undefined {
+    return this.board.markCascade(taskID, cascade);
+  }
+
+  markRevivedByUser(
+    taskID: string,
+    now = Date.now(),
+  ): BackgroundJobRecord | undefined {
+    return this.board.markRevivedByUser(taskID, now);
+  }
+
+  markAutoRevived(
+    taskID: string,
+    now = Date.now(),
+  ): BackgroundJobRecord | undefined {
+    return this.board.markAutoRevived(taskID, now);
   }
 
   markReconciled(

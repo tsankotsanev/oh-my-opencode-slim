@@ -160,6 +160,52 @@ describe('toLaneMirrorRecord', () => {
       reason: 'wrong file set',
     });
   });
+
+  test('carries the cascade stamp, which is how --cascade picks a group', () => {
+    const { board, record } = seedRunningLane();
+    board.updateStatus({ taskID: record.taskID, state: 'error' });
+    board.markCascade(record.taskID, {
+      parentSessionID: 'ses_parent',
+      at: 7_000,
+    });
+    const mirrored = toLaneMirrorRecord(
+      board.get(record.taskID) as NonNullable<ReturnType<typeof board.get>>,
+    );
+
+    // `at` is the cascade's identity: the CLI selects the newest group by it.
+    expect(mirrored.killedByCascade).toEqual({
+      parentSessionID: 'ses_parent',
+      at: 7_000,
+    });
+  });
+
+  test('carries the reconciled outcome so the CLI shares one revive rule', () => {
+    const { board, record } = seedRunningLane();
+    board.updateStatus({
+      taskID: record.taskID,
+      state: 'completed',
+      resultSummary: 'done',
+    });
+    board.markReconciled(record.taskID);
+    const mirrored = toLaneMirrorRecord(
+      board.get(record.taskID) as NonNullable<ReturnType<typeof board.get>>,
+    );
+
+    expect(mirrored.state).toBe('reconciled');
+    // Without this, `isReviveableRetainedJob` would disagree between the tool
+    // and the CLI for exactly the reconciled records.
+    expect(mirrored.terminalState).toBe('completed');
+  });
+
+  test('publishes the user-revive label for a resumed lane', () => {
+    const { board, record } = seedRunningLane();
+    board.markRevivedByUser(record.taskID, 8_000);
+    const mirrored = toLaneMirrorRecord(
+      board.get(record.taskID) as NonNullable<ReturnType<typeof board.get>>,
+    );
+
+    expect(mirrored.revivedByUser).toEqual({ at: 8_000 });
+  });
 });
 
 describe('toLaneMirrorRecord field hygiene', () => {

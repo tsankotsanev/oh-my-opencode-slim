@@ -287,7 +287,13 @@ export const BackgroundJobsConfigSchema = z.object({
     .boolean()
     .default(true)
     .describe(
-      'When true, the plugin publishes a small JSON mirror of the Background Job Board plus a server sidecar under the plugin data directory, so `omos lanes list/show/stop/say` can inspect and steer background lanes from a second terminal without spending an orchestrator turn. The mirror is written only (never read back: live lanes are rehydrated from the transcript) and the CLI writes only stop intents. Default enabled.',
+      'When true, the plugin publishes a small JSON mirror of the Background Job Board plus a server sidecar under the plugin data directory, so `omos lanes list/show/stop/say/revive` can inspect, steer and resume background lanes from a second terminal without spending an orchestrator turn. The mirror is written only (never read back: live lanes are rehydrated from the transcript); the CLI only appends stop/revive intents that the plugin claims to label lanes. Default enabled.',
+    ),
+  reviveOnCascade: z
+    .enum(['off', 'auto'])
+    .default('off')
+    .describe(
+      'EXPERIMENTAL. What to do with the background lanes that ESC on the orchestrator killed (its abort cascades to the whole session tree). "off" (default) only attributes the deaths: each lane is labelled on the board as interrupted by ESC, with its session intact, and is resumable with task_revive or `omos lanes revive`. "auto" additionally resumes those lanes by itself 13s after the cascade, through the same task_revive machinery, so the orchestrator is still notified when they finish. Four gestures keep ESC a panic button in "auto": the delay, `omos lanes stop` (recorded even on an already-dead lane and honoured immediately before the restart), a second ESC (cancels pending restarts), and a 10-minute per-lane cooldown. Attribution is heuristic: two per-pane ESCs on sibling lanes within three seconds look identical to one ESC on the parent.',
     ),
   concurrency: BackgroundTaskConcurrencyConfigSchema,
   waitForUserGuard: z

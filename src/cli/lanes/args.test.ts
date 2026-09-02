@@ -147,11 +147,44 @@ describe('parseLanesArgs', () => {
     });
   });
 
-  test('revive is reserved and points at task_revive instead of guessing', () => {
-    const parsed = parseLanesArgs(['revive', 'fix-1']);
-    expect(parsed).toMatchObject({
+  test('revive takes exactly one scope: a lane, --cascade, or --all', () => {
+    expect(parseLanesArgs(['revive', 'fix-1'])).toMatchObject({
+      command: 'revive',
+      selector: 'fix-1',
+      cascade: false,
+      all: false,
+    });
+    expect(parseLanesArgs(['revive', '--cascade'])).toMatchObject({
+      command: 'revive',
+      cascade: true,
+      all: false,
+    });
+    expect(parseLanesArgs(['revive', '--all'])).toMatchObject({
+      command: 'revive',
+      all: true,
+      cascade: false,
+    });
+
+    // Every ambiguous combination is an error rather than a guess: this
+    // command prompts real sessions.
+    for (const argv of [
+      ['revive'],
+      ['revive', '--cascade', '--all'],
+      ['revive', 'fix-1', '--cascade'],
+      ['revive', 'fix-1', 'ora-2'],
+    ]) {
+      expect(parseLanesArgs(argv)).toMatchObject({ command: 'error' });
+    }
+  });
+
+  test('the bulk scopes are refused on every other subcommand', () => {
+    expect(parseLanesArgs(['stop', 'fix-1', '--cascade'])).toMatchObject({
       command: 'error',
-      message: expect.stringContaining('task_revive'),
+      message: expect.stringContaining('--cascade'),
+    });
+    expect(parseLanesArgs(['list', '--all'])).toMatchObject({
+      command: 'error',
+      message: expect.stringContaining('--all'),
     });
   });
 
@@ -175,6 +208,8 @@ describe('parseLanesArgs', () => {
       '--force',
       'not a source of truth',
       'task_revive',
+      'revive --cascade',
+      'ESC on the orchestrator aborts every lane it owns',
     ]) {
       expect(LANES_HELP).toContain(fragment);
     }

@@ -1964,3 +1964,176 @@ describe('BackgroundJobBoard', () => {
     });
   });
 });
+
+describe('ESC cascade labels', () => {
+  function killedByEsc(taskID = 'ses_1', agent = 'fixer') {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID,
+      parentSessionID: 'parent-1',
+      agent,
+      description: 'fix the parser',
+      background: true,
+      now: 1_000,
+    });
+    board.updateStatus({
+      taskID,
+      state: 'error',
+      resultSummary: 'Aborted',
+      now: 2_000,
+    });
+    return board;
+  }
+
+  test('the stamp is a label: state, summary and reviveability are untouched', () => {
+    const board = killedByEsc();
+    const before = board.get('ses_1');
+    const after = board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+    });
+
+    expect(after?.killedByCascade).toEqual({
+      parentSessionID: 'parent-1',
+      at: 5_000,
+    });
+    expect(after?.state).toBe('error');
+    expect(after?.resultSummary).toBe(before?.resultSummary);
+    expect(after?.terminalUnreconciled).toBe(true);
+  });
+
+  test('refuses everything that is not an anonymous aborted lane', () => {
+    const running = new BackgroundJobBoard();
+    running.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      now: 1_000,
+    });
+    expect(
+      running.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 })
+        ?.killedByCascade,
+    ).toBeUndefined();
+
+    const userStopped = killedByEsc();
+    userStopped.markCancelledByUser('ses_1', 'I meant it');
+    expect(
+      userStopped.markCascade('ses_1', {
+        parentSessionID: 'parent-1',
+        at: 5_000,
+      })?.killedByCascade,
+    ).toBeUndefined();
+
+    const uncertain = killedByEsc();
+    uncertain.updateStatus({
+      taskID: 'ses_1',
+      state: 'error',
+      statusUncertain: true,
+      lastStatusError: 'lost the wire',
+      now: 2_500,
+    });
+    expect(
+      uncertain.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 })
+        ?.killedByCascade,
+    ).toBeUndefined();
+
+    const cancelled = killedByEsc();
+    cancelled.markCancelled('ses_1', 'superseded', 3_000, { force: true });
+    expect(
+      cancelled.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 })
+        ?.killedByCascade,
+    ).toBeUndefined();
+
+    expect(
+      killedByEsc().markCascade('ses_missing', {
+        parentSessionID: 'parent-1',
+        at: 5_000,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('a second stamp keeps the first instant, so a group cannot split', () => {
+    const board = killedByEsc();
+    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 9_000 });
+
+    expect(board.get('ses_1')?.killedByCascade?.at).toBe(5_000);
+  });
+
+  test('relaunching clears both labels but never the auto-revive cooldown', () => {
+    const board = killedByEsc();
+    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markAutoRevived('ses_1', 5_500);
+
+    const lease = board.acquireRelaunchLease(
+      'ses_1',
+      board.get('ses_1')?.generation as number,
+    );
+    board.registerLaunch({
+      taskID: 'ses_1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      background: true,
+      now: 6_000,
+      ...(lease ? { relaunchLease: lease } : {}),
+    });
+
+    expect(board.get('ses_1')?.killedByCascade).toBeUndefined();
+    expect(board.get('ses_1')?.revivedByUser).toBeUndefined();
+    // The cooldown MUST survive: every kill opens a fresh cascade, so a
+    // cleared cooldown would reopen the ESC -> revive -> ESC loop.
+    expect(board.get('ses_1')?.lastAutoRevivedAt).toBe(5_500);
+
+    expect(board.markRevivedByUser('ses_1', 6_100)?.revivedByUser).toEqual({
+      at: 6_100,
+    });
+  });
+
+  test('renders the recovery affordance, and one summary line per group', () => {
+    const board = killedByEsc('ses_1');
+    board.registerLaunch({
+      taskID: 'ses_2',
+      parentSessionID: 'parent-1',
+      agent: 'explorer',
+      description: 'map the config',
+      background: true,
+      now: 1_000,
+    });
+    board.updateStatus({ taskID: 'ses_2', state: 'error', now: 2_000 });
+    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCascade('ses_2', { parentSessionID: 'parent-1', at: 5_000 });
+
+    const rendered = board.formatForPrompt('parent-1') ?? '';
+    expect(rendered).toContain(
+      'Action: interrupted by ESC on the orchestrator; session intact - resume via task_revive or `omos lanes revive fix-1`',
+    );
+    expect(rendered).toContain(
+      '2 lanes were interrupted together by one ESC on the orchestrator (fix-1, exp-1)',
+    );
+    expect(rendered).toContain('omos lanes revive --cascade');
+
+    // Render-pure: two renders of an unchanged board are byte-identical.
+    expect(board.formatForPrompt('parent-1')).toBe(rendered);
+  });
+
+  test('a single-lane cascade gets its Action but no group summary', () => {
+    const board = killedByEsc();
+    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+
+    const rendered = board.formatForPrompt('parent-1') ?? '';
+    expect(rendered).toContain('Interrupted by: ESC on the orchestrator');
+    expect(rendered).not.toContain('were interrupted together');
+  });
+
+  test('a user stop outranks the cascade Action', () => {
+    const board = killedByEsc();
+    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCancelledByUser('ses_1', 'wrong file set');
+
+    const rendered = board.formatForPrompt('parent-1') ?? '';
+    expect(rendered).toContain('Stopped by: the user');
+    expect(rendered).not.toContain('Interrupted by: ESC');
+    // The stamp itself survives - it is still true - it just does not render.
+    expect(board.get('ses_1')?.killedByCascade).toBeDefined();
+  });
+});

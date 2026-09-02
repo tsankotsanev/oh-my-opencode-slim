@@ -75,6 +75,10 @@ const ALLOWLIST = new Map<string, string>([
     'Date.now() is the default silence clock: it decides WHETHER a lane is flagged and stamps LaneProgress.capturedAt for probe rate-limiting. Neither value is rendered — background-job-board.ts formats only the frozen reason text and the probe excerpt (text/lastTool/messageCount), never capturedAt or any age, so two renders of an unchanged lane are byte-identical.',
   ],
   [
+    'hooks/task-session-manager/cascade-attribution.ts',
+    'Date.now() is the cascade clock: it decides WHICH lanes belong to one ESC (the 3s window), when an auto-revive fires, and the per-lane cooldown. The one value that lands on a record is killedByCascade.at, and background-job-board.ts renders that stamp as fixed text plus the alias \u2014 never the timestamp, never an age \u2014 so two renders of an unchanged cascade are byte-identical.',
+  ],
+  [
     'hooks/image-hook.ts',
     'Date.now() throttles temp-image cleanup; extracted image paths are deterministic per part id.',
   ],

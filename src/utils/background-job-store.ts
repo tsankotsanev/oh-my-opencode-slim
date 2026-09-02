@@ -4,6 +4,7 @@ import type {
   BackgroundJobPromptMetadata,
   BackgroundJobRecord,
   BackgroundJobStatusInput,
+  CascadeStamp,
   ContextFile,
   LaneProgress,
   WallClockTimeoutClaimInput,
@@ -214,6 +215,24 @@ export interface BackgroundJobStore {
   markCancelledByUser(
     taskID: string,
     reason?: string,
+    now?: number,
+  ): BackgroundJobRecord | undefined;
+  /**
+   * Attribute an `error` record to one orchestrator abort (ESC). Label only;
+   * refused for orchestrator-owned cancels, user stops and uncertain records.
+   */
+  markCascade(
+    taskID: string,
+    cascade: CascadeStamp,
+  ): BackgroundJobRecord | undefined;
+  /** Label a running record as resumed by `omos lanes revive`. */
+  markRevivedByUser(
+    taskID: string,
+    now?: number,
+  ): BackgroundJobRecord | undefined;
+  /** Stamp the auto-revive cooldown, before the restart prompt is sent. */
+  markAutoRevived(
+    taskID: string,
     now?: number,
   ): BackgroundJobRecord | undefined;
   /** Store partial work captured by a probe. */

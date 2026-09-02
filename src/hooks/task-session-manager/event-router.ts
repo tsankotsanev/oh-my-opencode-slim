@@ -8,10 +8,12 @@
 import type { BackgroundJobExecution } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
+import { isReviveableRetainedJob } from '../../utils/lane-state';
 import { log } from '../../utils/logger';
 import {
   isAbortedSessionError,
   isTransportError,
+  sessionErrorMessage,
   transportSessionErrorReason,
 } from '../../utils/session-error';
 import {
@@ -22,6 +24,7 @@ import type {
   InjectedTerminalJobs,
   RetainedBoardSnapshotState,
 } from './board-injection';
+import type { CascadeTracker } from './cascade-attribution';
 import type {
   EarlyTaskRegistration,
   PendingTaskCall,
@@ -507,6 +510,24 @@ export async function handleEvent(
     claimUserStopIntent?: (
       sessionID: string,
     ) => { reason?: string } | undefined;
+    /**
+     * Lane control: claim the `omos lanes revive` intent that explains a busy
+     * signal on a settled lane. Absent when `backgroundJobs.laneControl` is
+     * off.
+     */
+    claimUserReviveIntent?: (sessionID: string) => { at: number } | undefined;
+    /**
+     * Register the run `omos lanes revive` just started as a revived run, so
+     * the parent gets the same synthesized `<task>` notification a
+     * `task_revive` would have produced. Absent when lane control is off.
+     */
+    adoptRevivedRun?: (sessionID: string) => Promise<void>;
+    /**
+     * ESC attribution. Fed the three signals it needs from this router:
+     * anonymous child aborts, orchestrator aborts, and managed-orchestrator
+     * busy/idle transitions.
+     */
+    cascade?: CascadeTracker;
   },
 ): Promise<void> {
   deps.inputWaits.trackInputWait(input.event);
@@ -721,6 +742,11 @@ export async function handleEvent(
       runningJobForSession: job?.state === 'running' || false,
     });
     if (sessionId && deps.options.shouldManageSession(sessionId)) {
+      // A managed orchestrator's idle is the B3 cascade signal: after ESC on
+      // an ALREADY idle parent the host emits a redundant idle it has no other
+      // reason to emit. Fed before reconciliation so the attribution is in
+      // place by the time anything renders the board.
+      deps.cascade?.noteOrchestratorIdle(sessionId);
       deps.idleReconciler.scheduleIdleReconciliation(sessionId);
     }
 
@@ -778,6 +804,17 @@ export async function handleEvent(
     }
     if (sessionId && deps.options.shouldManageSession(sessionId)) {
       const props = input.event.properties as { error?: unknown } | undefined;
+      // ESC on the orchestrator (probe B1): the parent's own abort is the
+      // unambiguous half of the two-sided cascade detection, and it confirms
+      // candidates recorded up to 3s BEFORE it — the children are aborted
+      // first. Foreground fallback aborts the same way to swap models, so a
+      // fallback in flight is excluded: that abort is ours, not the user's.
+      if (
+        isAbortedSessionError(props?.error) &&
+        !deps.options.isFallbackInProgress?.(sessionId)
+      ) {
+        deps.cascade?.noteOrchestratorAbort(sessionId);
+      }
       // Only clear injected terminal jobs for fatal errors.
       // Rate-limit errors are recovered by ForegroundFallbackManager
       // (abort + reprompt with fallback model); clearing the injected
@@ -816,9 +853,10 @@ export async function handleEvent(
             taskID: sessionId,
             state: 'error',
             expectedGeneration: observation?.generation,
-            resultSummary:
-              (props?.error as { message?: string } | undefined)?.message ??
-              'Session error',
+            // The SDK error shape is `{ name, data: { message } }`, so a bare
+            // `.message` read is undefined for every real session error and
+            // every record ends up saying "Session error".
+            resultSummary: sessionErrorMessage(props?.error, 'Session error'),
           });
           if (updated) deps.revivedRunTracker?.onTerminal(updated);
         }
@@ -866,8 +904,7 @@ export async function handleEvent(
           expectedGeneration: observation?.generation,
           resultSummary: transport
             ? transportSessionErrorReason(props?.error)
-            : ((props?.error as { message?: string } | undefined)?.message ??
-              'Session error'),
+            : sessionErrorMessage(props?.error, 'Session error'),
         });
         if (transport) {
           log('[task-session-manager] child transport error recorded', {
@@ -897,6 +934,12 @@ export async function handleEvent(
               labelled: terminal.cancelledByUser !== undefined,
               reason: intent.reason,
             });
+          } else {
+            // Nobody asked for this one. It becomes a cascade CANDIDATE: an
+            // orchestrator abort or idle within the window turns it into an
+            // attributed ESC death, and anything else leaves it an anonymous
+            // (but still revivable) error.
+            deps.cascade?.noteChildAbort(sessionId, updated.parentSessionID);
           }
         }
         if (terminal) deps.revivedRunTracker?.onTerminal(terminal);
@@ -935,6 +978,25 @@ export async function handleEvent(
       !isCurrentSessionObservation(deps.backgroundJobBoard, observation)
     ) {
       return;
+    }
+    if (sessionId && deps.options.shouldManageSession(sessionId)) {
+      // Feeds the cascade discriminator: a parent that was BUSY when its lane
+      // died has an innocent reason to go idle right afterwards (probe B2), so
+      // its idle needs two sibling deaths before it confirms anything.
+      deps.cascade?.noteOrchestratorBusy(sessionId);
+    }
+    // A settled lane going busy is not something a lane does on its own. When
+    // the user ran `omos lanes revive` from a second terminal, the intent line
+    // it left behind is the only evidence — claimed here so the run can be
+    // registered as a revived generation, exactly as `task_revive` would have,
+    // and the parent still gets its synthesized terminal notification.
+    if (sessionId && deps.claimUserReviveIntent && deps.adoptRevivedRun) {
+      const settled =
+        observation?.job ?? deps.backgroundJobBoard.get(sessionId);
+      if (settled && isReviveableRetainedJob(settled)) {
+        const intent = deps.claimUserReviveIntent(sessionId);
+        if (intent) await deps.adoptRevivedRun(sessionId);
+      }
     }
     // A busy EVENT (unlike a busy poll) is a transition the host only emits
     // when the session starts doing something, so it both seeds and refreshes

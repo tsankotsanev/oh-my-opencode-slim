@@ -12,10 +12,13 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   appendLaneIntent,
+  consumeReviveIntent,
   consumeStopIntent,
   createServerSidecar,
   INTENT_RETENTION_MS,
   laneIntentsPath,
+  RESUME_PROMPT_TEXT,
+  REVIVE_INTENT_WINDOW_MS,
   readLaneIntents,
   readServerInfo,
   SIDECAR_REFRESH_MS,
@@ -336,5 +339,70 @@ describe('stop intents', () => {
         sessionID: 'ses_a',
       }),
     ).toBe(false);
+  });
+});
+
+describe('revive intents', () => {
+  test('a revive line is claimed by the busy signal it explains, once', () => {
+    const file = laneIntentsPath(projectDir);
+    appendLaneIntent(file, {
+      at: 1_000,
+      action: 'revive',
+      sessionID: 'ses_child1',
+    });
+
+    expect(
+      consumeReviveIntent(file, 'ses_child1', { now: 1_200 })?.action,
+    ).toBe('revive');
+    expect(
+      consumeReviveIntent(file, 'ses_child1', { now: 1_300 }),
+    ).toBeUndefined();
+  });
+
+  test('stop and revive never claim each other', () => {
+    const file = laneIntentsPath(projectDir);
+    appendLaneIntent(file, {
+      at: 1_000,
+      action: 'revive',
+      sessionID: 'ses_child1',
+    });
+    appendLaneIntent(file, {
+      at: 1_010,
+      action: 'stop',
+      sessionID: 'ses_child1',
+      reason: 'no, stay dead',
+    });
+
+    // The user changed their mind: the stop must reach the stop reader and the
+    // revive must not be answered by it (or the lane would be relabelled).
+    expect(consumeStopIntent(file, 'ses_child1', { now: 1_100 })?.reason).toBe(
+      'no, stay dead',
+    );
+    expect(
+      consumeReviveIntent(file, 'ses_child1', { now: 1_100 })?.action,
+    ).toBe('revive');
+  });
+
+  test('an old revive line expires rather than explaining a later turn', () => {
+    const file = laneIntentsPath(projectDir);
+    appendLaneIntent(file, {
+      at: 1_000,
+      action: 'revive',
+      sessionID: 'ses_child1',
+    });
+
+    expect(
+      consumeReviveIntent(file, 'ses_child1', {
+        now: 1_000 + REVIVE_INTENT_WINDOW_MS + 1,
+      }),
+    ).toBeUndefined();
+  });
+
+  test('the resume prompt is one shared constant, and says what it must', () => {
+    // Both the CLI and the plugin's auto-revive send THIS text; two copies
+    // would be an invisible inconsistency in what a resumed lane is told.
+    expect(RESUME_PROMPT_TEXT).toContain('You were interrupted by an abort');
+    // The one thing the lane cannot know: an abort can land mid-operation.
+    expect(RESUME_PROMPT_TEXT).toContain('re-check its current state first');
   });
 });

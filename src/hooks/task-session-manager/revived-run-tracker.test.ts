@@ -262,6 +262,92 @@ describe('revived run tracker', () => {
     });
   });
 
+  /**
+   * A revived lane that is aborted reaches the parent through THIS
+   * notification, so its wording is the only account the orchestrator gets.
+   * "failed: Session error" for a lane the human stopped (or that ESC took
+   * down with everything else) invites a diagnose-and-retry loop for something
+   * that did not fail at all.
+   */
+  async function notifyAbortedRun(
+    label: (board: BackgroundJobBoard) => void,
+  ): Promise<string> {
+    const harness = createHarness(() => ({
+      data: [
+        { info: { id: 'baseline', role: 'user' }, parts: [] },
+        {
+          info: {
+            id: 'assistant-aborted',
+            role: 'assistant',
+            time: { completed: 3 },
+            error: {
+              name: 'MessageAbortedError',
+              data: { message: 'Aborted' },
+            },
+          },
+          parts: [],
+        },
+      ],
+    }));
+    harness.tracker.register({
+      taskID: harness.run.taskID,
+      generation: harness.run.generation,
+      parentSessionID: 'parent',
+      baselineMessageID: 'baseline',
+      description: 'inspect the change',
+    });
+    label(harness.board);
+    await harness.tracker.probe(harness.run.taskID, harness.run.generation);
+
+    const body = harness.prompt.mock.calls[0]?.[0] as {
+      body?: { parts?: Array<{ text?: string }> };
+    };
+    return body?.body?.parts?.[0]?.text ?? '';
+  }
+
+  test('renders a user-stopped lane as a stop, not a failure', async () => {
+    const text = await notifyAbortedRun((board) => {
+      board.updateStatus({
+        taskID: 'ses_child',
+        state: 'error',
+        resultSummary: 'Aborted',
+      });
+      board.markCancelledByUser('ses_child', 'wrong file set');
+    });
+
+    expect(text).toContain(
+      'Background task stopped by the user (omos lanes stop): inspect the change (wrong file set)',
+    );
+    expect(text).toContain('The user stopped this lane from a second terminal');
+    expect(text).not.toContain('Background task failed');
+  });
+
+  test('renders a cascade lane as an interruption, with the recovery', async () => {
+    const text = await notifyAbortedRun((board) => {
+      board.updateStatus({
+        taskID: 'ses_child',
+        state: 'error',
+        resultSummary: 'Aborted',
+      });
+      board.markCascade('ses_child', {
+        parentSessionID: 'parent',
+        at: 5_000,
+      });
+    });
+
+    expect(text).toContain(
+      'Background task interrupted by ESC on the orchestrator: inspect the change',
+    );
+    expect(text).toContain('task_revive(task_id) resumes it in place');
+    expect(text).not.toContain('Background task failed');
+  });
+
+  test('an unlabelled failure still reads as a failure', async () => {
+    const text = await notifyAbortedRun(() => {});
+
+    expect(text).toContain('Background task failed: inspect the change');
+  });
+
   test('retries parent notification without changing the terminal board state', async () => {
     let attempts = 0;
     const prompt = mock(async () => {
