@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { doctor, parseDoctorArgs } from './doctor';
 import { install } from './install';
+import { lanes } from './lanes';
 import { getGeneratedPresetNames, isGeneratedPresetName } from './providers';
 import type {
   BackgroundSubagentsArg,
@@ -75,6 +76,7 @@ oh-my-opencode-slim installer
 Usage:
   bunx oh-my-opencode-slim install [OPTIONS]
   bunx oh-my-opencode-slim doctor [OPTIONS]
+  omo lanes [list|show|stop|say] [OPTIONS]
 
 Options:
   --skills=yes|no|force  Install bundled skills; force replaces existing skill
@@ -94,6 +96,14 @@ Options:
 
 Doctor options:
   --json                 Print diagnostics as JSON
+
+Lane control (second terminal, zero orchestrator turns):
+  omo lanes              List this project's background subagent lanes
+  omo lanes show <alias> Print the tail of a lane's transcript
+  omo lanes stop <alias> Abort one lane (its session survives)
+  omo lanes say <alias> "…"
+                         Queue an instruction for a running lane
+  omo lanes --help       Full lane options
 
 Available presets: ${getGeneratedPresetNames().join(', ')}
 
@@ -122,6 +132,9 @@ async function main(): Promise<void> {
   } else if (args[0] === 'doctor') {
     const doctorArgs = parseDoctorArgs(args.slice(1));
     const exitCode = await doctor(doctorArgs);
+    process.exit(exitCode);
+  } else if (args[0] === 'lanes') {
+    const exitCode = await lanes(args.slice(1));
     process.exit(exitCode);
   } else if (args[0] === '-h' || args[0] === '--help') {
     printHelp();

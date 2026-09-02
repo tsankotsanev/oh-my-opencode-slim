@@ -479,6 +479,9 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       readContextMaxFiles: runtime.backgroundJobs.readContextMaxFiles,
       silenceDetection: runtime.backgroundJobs.silenceDetection,
       staleAfterMs: runtime.backgroundJobs.staleAfterMs,
+      // `omo lanes` control channel. Passed explicitly: the hook defaults it
+      // off so no test or embedded construction writes to the data dir.
+      laneControl: runtime.backgroundJobs.laneControl,
       backgroundJobBoard: backgroundJobCoordinator,
       backgroundJobSupervisor,
       backgroundTaskConcurrency,

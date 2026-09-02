@@ -11,15 +11,17 @@ import {
 import type { BackgroundJobState } from '../utils/background-job-board';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { log } from '../utils/logger';
+import { createServerUrlResolver } from '../utils/server-url';
 import {
   CmuxSessionLifecycle,
   type CmuxSessionLifecycleOptions,
 } from './cmux/session-lifecycle';
 import { CmuxSessionStore } from './cmux/session-state';
+import { decoratePaneTitle } from './shared';
 
 type BackgroundJobReader = Pick<
   BackgroundJobStore,
-  'getState' | 'deferIfRunning' | 'clearDeferredClose'
+  'getState' | 'deferIfRunning' | 'clearDeferredClose' | 'field'
 >;
 
 interface TrackedSession {
@@ -109,50 +111,6 @@ export function resetMultiplexerSessionManagerState(): void {
 
 export type MultiplexerSessionManagerOptions = CmuxSessionLifecycleOptions &
   SessionReadinessOptions;
-
-function validServerUrl(value: unknown): string | null {
-  if (typeof value !== 'string' && !(value instanceof URL)) return null;
-  try {
-    const url = new URL(value.toString());
-    return url.protocol === 'http:' || url.protocol === 'https:'
-      ? url.toString()
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-function clientBaseUrl(client: unknown): string | null {
-  try {
-    if (!client || typeof client !== 'object' || !('_client' in client))
-      return null;
-    const internal = client._client;
-    if (!internal || typeof internal !== 'object' || !('getConfig' in internal))
-      return null;
-    const getConfig = internal.getConfig;
-    if (typeof getConfig !== 'function') return null;
-    const config: unknown = getConfig.call(internal);
-    if (!config || typeof config !== 'object' || !('baseUrl' in config))
-      return null;
-    return validServerUrl(config.baseUrl);
-  } catch {
-    return null;
-  }
-}
-
-function createServerUrlResolver(ctx: PluginInput): () => string | null {
-  return () => {
-    try {
-      const serverUrl = validServerUrl(ctx.serverUrl);
-      if (serverUrl) return serverUrl;
-    } catch {}
-    try {
-      return clientBaseUrl(ctx.client);
-    } catch {
-      return null;
-    }
-  };
-}
 
 /**
  * Tracks child sessions and spawns/closes multiplexer panes for them.
@@ -247,6 +205,24 @@ export class MultiplexerSessionManager {
       trackedSessions: this.sessions.size,
       knownSessions: this.knownSessions.size,
     });
+  }
+
+  /**
+   * Pane title with the lane alias prefixed, when the board knows one.
+   *
+   * Read at spawn time rather than at `session.created`: the board registers
+   * the launch from its own hook, and the spawn path already waits for the
+   * child session to be visible to the server, so by here the alias is
+   * normally available. A missing alias simply leaves the title untouched.
+   */
+  private paneTitle(sessionId: string, title: string): string {
+    let alias: string | undefined;
+    try {
+      alias = this.backgroundJobBoard?.field(sessionId, 'alias');
+    } catch {
+      alias = undefined;
+    }
+    return decoratePaneTitle(title, alias);
   }
 
   /** Fresh options for a readiness wait; the manager owns the abort signal. */
@@ -348,7 +324,7 @@ export class MultiplexerSessionManager {
       const paneResult = await this.multiplexer
         .spawnPane(
           sessionId,
-          title,
+          this.paneTitle(sessionId, title),
           serverUrl,
           directory,
           this.multiplexer.type === 'tmux'
@@ -950,7 +926,7 @@ export class MultiplexerSessionManager {
       const paneResult = await this.multiplexer
         .spawnPane(
           sessionId,
-          known.title,
+          this.paneTitle(sessionId, known.title),
           serverUrl,
           known.directory,
           this.multiplexer.type === 'tmux'

@@ -10,6 +10,7 @@ import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
 import { log } from '../../utils/logger';
 import {
+  isAbortedSessionError,
   isTransportError,
   transportSessionErrorReason,
 } from '../../utils/session-error';
@@ -311,6 +312,62 @@ function isInjectedUserMessageEvent(
   );
 }
 
+/**
+ * Permission events that arm the HITL stamp on a lane.
+ *
+ * The installed SDK (1.18.x) declares `permission.updated` for the ask and
+ * `permission.replied` for the answer; `permission.asked` does not exist in
+ * its event union, but upstream's input-wait tracker still listens for it, so
+ * both names are accepted here rather than betting on one host version.
+ */
+const PERMISSION_ASK_EVENTS = new Set([
+  'permission.updated',
+  'permission.asked',
+]);
+
+/** Events that resolve a permission prompt (reply, rejection, cancellation). */
+const PERMISSION_RESOLVE_EVENTS = new Set([
+  'permission.replied',
+  'permission.rejected',
+  'permission.cancelled',
+]);
+
+/** Permission-type names are plain identifiers (`bash`, `edit`, `webfetch`). */
+const PERMISSION_TOOL_PATTERN = /^[\w.:-]{1,40}$/;
+
+/**
+ * What the lane is asking permission for.
+ *
+ * `properties.type` is the permission type, which for tool permissions IS the
+ * tool name; `title` is the human sentence and only used when the type is
+ * missing or not a plain name. Truncated because it is rendered into the
+ * board.
+ */
+function permissionToolName(properties: unknown): string | undefined {
+  const props = isRecord(properties) ? properties : undefined;
+  const type = typeof props?.type === 'string' ? props.type.trim() : '';
+  if (type && PERMISSION_TOOL_PATTERN.test(type)) return type;
+  const title = typeof props?.title === 'string' ? props.title.trim() : '';
+  if (title) return title.slice(0, 60);
+  return type || undefined;
+}
+
+/** Permission request id, across the two spellings hosts have used. */
+function permissionRequestID(
+  properties: unknown,
+  kind: 'ask' | 'resolve',
+): string | undefined {
+  const props = isRecord(properties) ? properties : undefined;
+  const candidates =
+    kind === 'ask'
+      ? [props?.id, props?.permissionID, props?.requestID]
+      : [props?.permissionID, props?.requestID, props?.id];
+  const found = candidates.find(
+    (value) => typeof value === 'string' && value.length > 0,
+  );
+  return typeof found === 'string' ? found : undefined;
+}
+
 function isCurrentSessionObservation(
   backgroundJobBoard: BackgroundJobStore,
   observation: SessionEventObservation,
@@ -423,6 +480,15 @@ export async function handleEvent(
     releaseConcurrencyTask?: (taskID: string) => void;
     observeSyntheticTerminalPart?: (part: unknown) => void;
     revivedRunTracker?: RevivedRunTracker;
+    /**
+     * Lane control: claim the `omo lanes stop` intent that explains an abort
+     * of this lane, if the CLI wrote one in the last minute. Returns
+     * `undefined` for the normal case (no user stop), and is absent entirely
+     * when `backgroundJobs.laneControl` is off.
+     */
+    claimUserStopIntent?: (
+      sessionID: string,
+    ) => { reason?: string } | undefined;
   },
 ): Promise<void> {
   deps.inputWaits.trackInputWait(input.event);
@@ -450,6 +516,45 @@ export async function handleEvent(
 
   if (input.event.type === 'message.part.updated') {
     deps.observeSyntheticTerminalPart?.(input.event.properties?.part);
+    return;
+  }
+
+  // HITL seam for CHILD lanes. Upstream's input-wait tracker (consulted above)
+  // only follows orchestrator sessions, so without this a lane parked on a
+  // permission prompt looks identical to a frozen one: silence detection would
+  // eventually flag it, and neither the board nor `omo lanes list` could say
+  // why it went quiet. The stamp lives on the lane's own board record, so it
+  // needs no second tracker and dies with the run.
+  if (PERMISSION_ASK_EVENTS.has(input.event.type)) {
+    const sessionID = input.event.properties?.sessionID;
+    const tool = permissionToolName(input.event.properties);
+    if (sessionID && tool) {
+      const stamped = deps.backgroundJobBoard.markAwaitingPermission(
+        sessionID,
+        {
+          tool,
+          permissionID: permissionRequestID(input.event.properties, 'ask'),
+          now: eventActivityAt(input, deps.options.now?.() ?? Date.now()),
+        },
+      );
+      if (stamped?.awaitingPermission) {
+        log('[task-session-manager] lane awaiting permission', {
+          sessionID,
+          alias: stamped.alias,
+          tool: stamped.awaitingPermission.tool,
+        });
+      }
+    }
+    return;
+  }
+
+  if (PERMISSION_RESOLVE_EVENTS.has(input.event.type)) {
+    const sessionID = input.event.properties?.sessionID;
+    if (sessionID) {
+      deps.backgroundJobBoard.clearAwaitingPermission(sessionID, {
+        permissionID: permissionRequestID(input.event.properties, 'resolve'),
+      });
+    }
     return;
   }
 
@@ -752,7 +857,30 @@ export async function handleEvent(
             resultSummary: updated?.resultSummary,
           });
         }
-        if (updated) deps.revivedRunTracker?.onTerminal(updated);
+        // An abort is the only outcome a second terminal can cause, so this is
+        // the one place a `omo lanes stop` can be attributed. The claim is
+        // pull-based and consumes the line, so a later abort of the same lane
+        // cannot inherit the label; the board itself refuses to overwrite an
+        // orchestrator-owned cancellation.
+        let terminal = updated;
+        if (updated && isAbortedSessionError(props?.error)) {
+          const intent = deps.claimUserStopIntent?.(sessionId);
+          if (intent) {
+            terminal =
+              deps.backgroundJobBoard.markCancelledByUser(
+                sessionId,
+                intent.reason,
+              ) ?? updated;
+            log('[task-session-manager] lane stopped by user (omo lanes)', {
+              sessionID: sessionId,
+              alias: terminal.alias,
+              state: terminal.state,
+              labelled: terminal.cancelledByUser !== undefined,
+              reason: intent.reason,
+            });
+          }
+        }
+        if (terminal) deps.revivedRunTracker?.onTerminal(terminal);
       }
     }
 

@@ -15,6 +15,13 @@ import {
   recordBackgroundJobSuppression,
 } from '../../utils';
 import { isRecord as isObjectRecord } from '../../utils/guards';
+import {
+  consumeStopIntent,
+  createServerSidecar,
+  laneIntentsPath,
+} from '../../utils/lane-control';
+import { createLaneMirror } from '../../utils/lane-mirror';
+import { createLaneServerUrlResolver } from '../../utils/server-url';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
 import {
@@ -202,6 +209,21 @@ export function createTaskSessionManagerHook(
     silenceDetection?: boolean;
     /** `backgroundJobs.staleAfterMs`; silence budget for a busy lane. */
     staleAfterMs?: number;
+    /**
+     * `backgroundJobs.laneControl` — the `omo lanes` control channel (board
+     * mirror + server sidecar + stop intents).
+     *
+     * Defaults to OFF here even though the user-facing config defaults to on:
+     * the flag is passed explicitly from `src/index.ts`, which is the only
+     * caller that knows both the real project directory and the user's config.
+     * A hook constructed in a test therefore never writes to the XDG data dir
+     * unless it asks to.
+     */
+    laneControl?: boolean;
+    /** Test seams for the lane-control artefacts. */
+    laneMirrorFile?: string;
+    laneServerInfoFile?: string;
+    laneIntentsFile?: string;
     revivedRunTracker?: RevivedRunTracker;
   },
 ) {
@@ -379,6 +401,35 @@ export function createTaskSessionManagerHook(
     options.backgroundJobSupervisor,
   );
 
+  // ── Lane control (`omo lanes`) ─────────────────────────────────────
+  // Write-only, out-of-band, and never read back: the mirror exists so a
+  // SECOND terminal can list/steer lanes at zero token cost, while this
+  // process keeps rehydrating from the transcript exactly as before. See
+  // src/utils/lane-mirror.ts for why the direction of each file is a rule.
+  const laneControlEnabled = options.laneControl === true;
+  const laneIntentsFile = laneControlEnabled
+    ? (options.laneIntentsFile ?? laneIntentsPath(_ctx.directory))
+    : undefined;
+  const laneServerSidecar = createServerSidecar({
+    directory: _ctx.directory,
+    enabled: laneControlEnabled,
+    resolveServerUrl: createLaneServerUrlResolver(_ctx),
+    ...(options.laneServerInfoFile ? { file: options.laneServerInfoFile } : {}),
+  });
+  const laneMirror = createLaneMirror({
+    directory: _ctx.directory,
+    enabled: laneControlEnabled,
+    lanes: () => backgroundJobBoard.list(),
+    // The mirror only writes when the board changed, which is also the
+    // cheapest moment to prove the server is still alive.
+    onFlush: () => laneServerSidecar.refresh(),
+    ...(options.laneMirrorFile ? { file: options.laneMirrorFile } : {}),
+  });
+  const claimUserStopIntent = laneIntentsFile
+    ? (sessionID: string): { reason?: string } | undefined =>
+        consumeStopIntent(laneIntentsFile, sessionID)
+    : undefined;
+
   return {
     markRevivedRunPending: (taskID: string): void => {
       taskContextTracker.pendingManagedTaskIds.add(taskID);
@@ -489,6 +540,7 @@ export function createTaskSessionManagerHook(
         },
       });
       runtimeStatusReconciler.schedule();
+      laneMirror.scheduleFlush();
     },
 
     'experimental.chat.messages.transform': async (
@@ -542,6 +594,9 @@ export function createTaskSessionManagerHook(
 
       if (rehydratedCount > 0) {
         await runtimeStatusReconciler.reconcile();
+        // Rehydration is the one board mutation with no event behind it, so
+        // the mirror would otherwise miss lanes recovered after a restart.
+        laneMirror.scheduleFlush();
       }
     },
 
@@ -580,6 +635,11 @@ export function createTaskSessionManagerHook(
 
       if (input.event.type === 'server.instance.disposed') {
         runtimeStatusReconciler.dispose();
+        // Flush last, then drop the sidecar: a missing sidecar makes the CLI
+        // say "start OpenCode or pass --server", whereas a stale one would
+        // send it at a dead (or recycled) port.
+        laneMirror.dispose();
+        laneServerSidecar.dispose();
       }
       return handleEvent(input, {
         inputWaits,
@@ -599,7 +659,11 @@ export function createTaskSessionManagerHook(
         observeSyntheticTerminalPart: (part) =>
           observeSyntheticTerminalPart(injectionState, part),
         revivedRunTracker: options.revivedRunTracker,
-      }).then(() => runtimeStatusReconciler.schedule());
+        ...(claimUserStopIntent ? { claimUserStopIntent } : {}),
+      }).then(() => {
+        runtimeStatusReconciler.schedule();
+        laneMirror.scheduleFlush();
+      });
     },
   };
 }

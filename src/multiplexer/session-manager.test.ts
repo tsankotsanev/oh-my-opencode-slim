@@ -156,6 +156,71 @@ describe('MultiplexerSessionManager', () => {
       );
     });
 
+    test('prefixes the pane title with the lane alias when the board knows it', async () => {
+      const ctx = createMockContext();
+      const manager = new MultiplexerSessionManager(
+        ctx,
+        defaultMultiplexerConfig,
+        {
+          getState: () => undefined,
+          deferIfRunning: () => false,
+          clearDeferredClose: () => {},
+          field: ((sessionId: string) =>
+            sessionId === 'child-123' ? 'fix-1' : undefined) as never,
+        },
+      );
+
+      await manager.onSessionCreated({
+        type: 'session.created',
+        properties: {
+          info: {
+            id: 'child-123',
+            parentID: 'parent-456',
+            title: 'Test Worker',
+          },
+        },
+      });
+
+      expect(mockMultiplexer.spawnPane).toHaveBeenCalledWith(
+        'child-123',
+        'fix-1 · Test Worker',
+        `http://localhost:${process.env.OPENCODE_PORT ?? '4096'}/`,
+        '/test/directory',
+        { parentSessionId: 'parent-456' },
+      );
+    });
+
+    test('a throwing board lookup leaves the title untouched', async () => {
+      const ctx = createMockContext();
+      const manager = new MultiplexerSessionManager(
+        ctx,
+        defaultMultiplexerConfig,
+        {
+          getState: () => undefined,
+          deferIfRunning: () => false,
+          clearDeferredClose: () => {},
+          field: (() => {
+            throw new Error('board exploded');
+          }) as never,
+        },
+      );
+
+      await manager.onSessionCreated({
+        type: 'session.created',
+        properties: {
+          info: { id: 'child-9', parentID: 'parent-1', title: 'Worker' },
+        },
+      });
+
+      expect(mockMultiplexer.spawnPane).toHaveBeenCalledWith(
+        'child-9',
+        'Worker',
+        `http://localhost:${process.env.OPENCODE_PORT ?? '4096'}/`,
+        '/test/directory',
+        { parentSessionId: 'parent-1' },
+      );
+    });
+
     test('ignores sessions without parentID', async () => {
       const ctx = createMockContext();
       const manager = new MultiplexerSessionManager(

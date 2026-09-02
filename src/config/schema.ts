@@ -283,6 +283,12 @@ export const BackgroundJobsConfigSchema = z.object({
     .describe(
       'Silence budget for a busy background child session before it is flagged as status uncertain (10,000–2,147,483,647ms). Default 300,000 (5 minutes). Lanes executing a tool, retrying a provider call, or awaiting a permission answer are exempt.',
     ),
+  laneControl: z
+    .boolean()
+    .default(true)
+    .describe(
+      'When true, the plugin publishes a small JSON mirror of the Background Job Board plus a server sidecar under the plugin data directory, so `omo lanes list/show/stop/say` can inspect and steer background lanes from a second terminal without spending an orchestrator turn. The mirror is written only (never read back: live lanes are rehydrated from the transcript) and the CLI writes only stop intents. Default enabled.',
+    ),
   concurrency: BackgroundTaskConcurrencyConfigSchema,
   waitForUserGuard: z
     .boolean()

@@ -65,6 +65,13 @@ export interface LaneProgress {
   capturedAt: number;
 }
 
+/** Open permission prompt on a lane; `permissionID` fences the clear. */
+export interface AwaitingPermission {
+  tool: string;
+  at: number;
+  permissionID?: string;
+}
+
 export interface BackgroundJobRecord {
   taskID: string;
   parentSessionID: string;
@@ -116,6 +123,24 @@ export interface BackgroundJobRecord {
   silenceReason?: string;
   /** Partial work captured by the most recent silence probe. */
   lastProgress?: LaneProgress;
+  /**
+   * Open permission prompt for this lane.
+   *
+   * A lane blocked on a human answering a permission request is silent by
+   * design, so this both exempts it from silence detection and gives the
+   * parent (and `omo lanes list`) the one fact that explains the pause. The
+   * timestamp is bookkeeping only and is deliberately never rendered.
+   */
+  awaitingPermission?: AwaitingPermission;
+  /**
+   * The user stopped this lane from a second terminal (`omo lanes stop`).
+   *
+   * A LABEL, never a state: the terminal state itself is still whatever the
+   * lifecycle recorded (an aborted child lands as `error`), so a lost or
+   * duplicated intent line can only change the wording the orchestrator
+   * reads, never whether the lane is considered finished.
+   */
+  cancelledByUser?: { at: number; reason?: string };
   /** First non-busy runtime observation for the current stop-confirmation grace. */
   stopConfirmationStartedAt?: number;
   completedAt?: number;
@@ -332,6 +357,8 @@ export class BackgroundJobBoard implements BackgroundJobStore {
         silenceDetectedAt: undefined,
         silenceReason: undefined,
         lastProgress: undefined,
+        awaitingPermission: undefined,
+        cancelledByUser: undefined,
         stopConfirmationStartedAt: undefined,
         lastUsedAt: now,
         updatedAt: now,
@@ -441,6 +468,9 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       // A terminal result answers the question the silence flag was asking.
       silenceDetectedAt: terminal ? undefined : existing.silenceDetectedAt,
       silenceReason: terminal ? undefined : existing.silenceReason,
+      // Same for an open permission prompt: whatever it was waiting for, the
+      // run is over and the stamp would only mislead the parent.
+      awaitingPermission: terminal ? undefined : existing.awaitingPermission,
     };
 
     if (input.state === 'completed') {
@@ -574,10 +604,21 @@ export class BackgroundJobBoard implements BackgroundJobStore {
 
     const lastActivityAt = Math.max(existing.lastActivityAt ?? 0, now);
     if (existing.silenceDetectedAt === undefined) {
-      if (lastActivityAt === existing.lastActivityAt) return existing;
-      // Heartbeat only: no state transition, so nothing else on the record
-      // (and nothing rendered) changes.
-      const beat: BackgroundJobRecord = { ...existing, lastActivityAt };
+      // Output while a permission prompt is stamped means the lane moved on
+      // without us seeing the reply (a dropped event, or a plugin restart).
+      // Self-healing beats a stamp that nothing can remove.
+      const dropsPermissionStamp = existing.awaitingPermission !== undefined;
+      if (lastActivityAt === existing.lastActivityAt && !dropsPermissionStamp) {
+        return existing;
+      }
+      // Otherwise a heartbeat only: no state transition, so nothing else on
+      // the record (and nothing rendered) changes.
+      const beat: BackgroundJobRecord = {
+        ...existing,
+        lastActivityAt,
+        awaitingPermission: undefined,
+        ...(dropsPermissionStamp ? { updatedAt: now } : {}),
+      };
       this.jobs.set(taskID, beat);
       return beat;
     }
@@ -587,6 +628,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
     const revived: BackgroundJobRecord = {
       ...existing,
       lastActivityAt,
+      awaitingPermission: undefined,
       silenceDetectedAt: undefined,
       silenceReason: undefined,
       lastProgress: undefined,
@@ -636,6 +678,107 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       lastProgress: options.progress ?? existing.lastProgress,
       updatedAt:
         existing.silenceDetectedAt === undefined ? now : existing.updatedAt,
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /**
+   * Stamp an open permission prompt on a RUNNING lane.
+   *
+   * Only while running, deliberately: the stamp's whole purpose is to explain
+   * why a live lane is quiet, and a stamp that could be applied to a settled
+   * record would outlive the question it describes (Gate-3 M2). It is cleared
+   * by {@link clearAwaitingPermission} on the reply, by {@link recordActivity}
+   * when the lane produces output again, and by every terminal transition, so
+   * a missed `permission.replied` cannot make the exemption permanent.
+   */
+  markAwaitingPermission(
+    taskID: string,
+    input: { tool: string; permissionID?: string; now?: number },
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (existing?.state !== 'running') return existing;
+    const tool = normalizeWhitespace(input.tool);
+    if (!tool) return existing;
+    const at = input.now ?? Date.now();
+    if (
+      existing.awaitingPermission?.tool === tool &&
+      existing.awaitingPermission.permissionID === input.permissionID
+    ) {
+      return existing;
+    }
+
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      awaitingPermission: {
+        tool,
+        at,
+        ...(input.permissionID ? { permissionID: input.permissionID } : {}),
+      },
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /**
+   * Drop the permission stamp.
+   *
+   * `permissionID` fences the clear: a reply to an older, superseded prompt
+   * must not unstamp the one that is currently open. A reply with no id (or a
+   * record stamped before ids were observed) clears unconditionally, because
+   * the alternative is a stamp nothing can remove.
+   */
+  clearAwaitingPermission(
+    taskID: string,
+    options: { permissionID?: string } = {},
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (!existing?.awaitingPermission) return existing;
+    const stamped = existing.awaitingPermission.permissionID;
+    if (
+      options.permissionID !== undefined &&
+      stamped !== undefined &&
+      stamped !== options.permissionID
+    ) {
+      return existing;
+    }
+
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      awaitingPermission: undefined,
+    };
+    this.jobs.set(taskID, updated);
+    return updated;
+  }
+
+  /**
+   * Attribute an already-recorded outcome to a user `omo lanes stop`.
+   *
+   * Label only — the state, summary and reconciliation flags are untouched, so
+   * an aborted child stays the `error` record its lifecycle produced and
+   * remains revivable in place (`isReviveableRetainedJob`).
+   *
+   * Refused when the orchestrator's own cancellation path owns this run
+   * (`cancellationRequested`, set under a cancellation lease by
+   * `task_cancel`/`task_revive`): that outcome is already explained, and
+   * double-labelling it would credit the user with a cancel the model asked
+   * for.
+   */
+  markCancelledByUser(
+    taskID: string,
+    reason?: string,
+    now = Date.now(),
+  ): BackgroundJobRecord | undefined {
+    const existing = this.jobs.get(taskID);
+    if (!existing) return undefined;
+    if (existing.cancellationRequested) return existing;
+    if (existing.cancelledByUser !== undefined) return existing;
+
+    const trimmed = reason ? normalizeWhitespace(reason) : '';
+    const updated: BackgroundJobRecord = {
+      ...existing,
+      cancelledByUser: { at: now, ...(trimmed ? { reason: trimmed } : {}) },
     };
     this.jobs.set(taskID, updated);
     return updated;
@@ -704,6 +847,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       lastStatusError: undefined,
       silenceDetectedAt: undefined,
       silenceReason: undefined,
+      awaitingPermission: undefined,
       stopConfirmationStartedAt: undefined,
     };
     this.jobs.set(taskID, updated);
@@ -869,6 +1013,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       lastStatusError: undefined,
       silenceDetectedAt: undefined,
       silenceReason: undefined,
+      awaitingPermission: undefined,
       stopConfirmationStartedAt: undefined,
     };
 
@@ -1073,6 +1218,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       totalErrors: (existing.totalErrors ?? 0) + 1,
       silenceDetectedAt: undefined,
       silenceReason: undefined,
+      awaitingPermission: undefined,
       stopConfirmationStartedAt: undefined,
     };
     this.jobs.set(input.taskID, updated);
@@ -1460,10 +1606,50 @@ function formatJob(job: BackgroundJobRecord): string {
     lines.push(`  Status: ${promptSafe(job.lastStatusError)}`);
   }
 
+  const waiting = formatAwaitingPermission(job);
+  if (waiting) lines.push(waiting);
+
+  const userStop = formatUserStop(job);
+  if (userStop) lines.push(...userStop);
+
   const lastSeen = formatLastSeen(job);
   if (lastSeen) lines.push(lastSeen);
 
   return lines.join('\n');
+}
+
+/**
+ * Why a live lane is quiet: a human has not answered its permission prompt.
+ *
+ * Only the tool name is rendered — no timestamp, no age — so a lane parked on
+ * the same prompt renders byte-identically on every injection.
+ */
+function formatAwaitingPermission(
+  job: BackgroundJobRecord,
+): string | undefined {
+  if (job.state !== 'running') return undefined;
+  const waiting = job.awaitingPermission;
+  return waiting
+    ? `  Waiting: permission for ${promptSafe(waiting.tool)}`
+    : undefined;
+}
+
+/**
+ * Attribute a terminal record to the user's own `omo lanes stop`.
+ *
+ * The label is advisory (an intent line can be lost or, in theory, reused), so
+ * the text never contradicts the state — it explains who ended the run and
+ * what the orchestrator should do about it. Frozen reason text only; nothing
+ * here is derived from the clock.
+ */
+function formatUserStop(job: BackgroundJobRecord): string[] | undefined {
+  const stop = job.cancelledByUser;
+  if (!stop) return undefined;
+  const reason = stop.reason ? `: ${promptSafe(stop.reason)}` : '';
+  return [
+    `  Stopped by: the user, from a second terminal (omo lanes stop)${reason}`,
+    '  Action: treat this as a user cancellation - do not relaunch it unasked; its session is intact, so task_revive(task_id) resumes it if the user asks.',
+  ];
 }
 
 /**

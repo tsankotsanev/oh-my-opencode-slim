@@ -1,5 +1,6 @@
 import { POLL_INTERVAL_BACKGROUND_MS } from '../../config';
 import { log } from '../../utils/logger';
+import { decoratePaneTitle } from '../shared';
 import type { Multiplexer } from '../types';
 import { isServerRunning } from '../types';
 import { CmuxClosePolicy, type CmuxCloseReason } from './close-policy';
@@ -24,6 +25,8 @@ export interface CmuxSessionEvent {
 interface BackgroundJobs {
   deferIfRunning(session: string): boolean;
   clearDeferredClose(session: string): void;
+  /** Lane alias for the pane title; optional so older callers still fit. */
+  field?(session: string, key: 'alias'): string | undefined;
 }
 
 export interface CmuxSessionLifecycleOptions {
@@ -350,12 +353,23 @@ export class CmuxSessionLifecycle {
     try {
       return await this.multiplexer.spawnPane(
         record.session,
-        record.title,
+        // The stored title stays undecorated: it is compared and re-used for
+        // respawns, and only the pane label needs the lane alias.
+        decoratePaneTitle(record.title, this.laneAlias(record.session)),
         serverUrl,
         record.directory,
       );
     } catch {
       return { success: false, error: 'hard' as const };
+    }
+  }
+
+  /** Board alias for a lane, or undefined when it is not registered (yet). */
+  private laneAlias(session: string): string | undefined {
+    try {
+      return this.backgroundJobs?.field?.(session, 'alias');
+    } catch {
+      return undefined;
     }
   }
 

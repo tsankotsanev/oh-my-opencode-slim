@@ -279,6 +279,28 @@ export class BackgroundJobCoordinator implements BackgroundJobStore {
     return this.board.recordProgress(taskID, progress, expectedGeneration);
   }
 
+  markAwaitingPermission(
+    taskID: string,
+    input: { tool: string; permissionID?: string; now?: number },
+  ): BackgroundJobRecord | undefined {
+    return this.board.markAwaitingPermission(taskID, input);
+  }
+
+  clearAwaitingPermission(
+    taskID: string,
+    options: { permissionID?: string } = {},
+  ): BackgroundJobRecord | undefined {
+    return this.board.clearAwaitingPermission(taskID, options);
+  }
+
+  markCancelledByUser(
+    taskID: string,
+    reason?: string,
+    now = Date.now(),
+  ): BackgroundJobRecord | undefined {
+    return this.board.markCancelledByUser(taskID, reason, now);
+  }
+
   markReconciled(
     taskID: string,
     now = Date.now(),

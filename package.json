@@ -19,7 +19,8 @@
     }
   },
   "bin": {
-    "oh-my-opencode-slim": "./dist/cli/index.js"
+    "oh-my-opencode-slim": "./dist/cli/index.js",
+    "omo": "./dist/cli/index.js"
   },
   "type": "module",
   "license": "MIT",

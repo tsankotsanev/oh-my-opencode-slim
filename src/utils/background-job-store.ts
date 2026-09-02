@@ -193,6 +193,29 @@ export interface BackgroundJobStore {
       expectedGeneration?: number;
     },
   ): BackgroundJobRecord | undefined;
+  /**
+   * Stamp an open permission prompt on a running lane (HITL seam). Exempts it
+   * from silence detection and surfaces `Waiting: permission for <tool>`.
+   */
+  markAwaitingPermission(
+    taskID: string,
+    input: { tool: string; permissionID?: string; now?: number },
+  ): BackgroundJobRecord | undefined;
+  /** Drop the permission stamp; `permissionID` fences superseded replies. */
+  clearAwaitingPermission(
+    taskID: string,
+    options?: { permissionID?: string },
+  ): BackgroundJobRecord | undefined;
+  /**
+   * Label an already-recorded outcome as the user's own `omo lanes stop`.
+   * State/summary are untouched; refused when the orchestrator's cancellation
+   * path owns the run.
+   */
+  markCancelledByUser(
+    taskID: string,
+    reason?: string,
+    now?: number,
+  ): BackgroundJobRecord | undefined;
   /** Store partial work captured by a probe. */
   recordProgress(
     taskID: string,

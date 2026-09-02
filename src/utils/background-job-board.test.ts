@@ -1756,4 +1756,211 @@ describe('BackgroundJobBoard', () => {
       expect(prompt).toContain('Context read by');
     });
   });
+  describe('lane control labels (permission stamp + user stop)', () => {
+    function runningLane() {
+      const board = new BackgroundJobBoard();
+      board.registerLaunch({
+        taskID: 'ses_1',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+        description: 'fix the parser',
+        now: 1_000,
+      });
+      return board;
+    }
+
+    test('stamps an open permission prompt on a running lane', () => {
+      const board = runningLane();
+      const stamped = board.markAwaitingPermission('ses_1', {
+        tool: 'bash',
+        permissionID: 'per_1',
+        now: 2_000,
+      });
+      expect(stamped?.awaitingPermission).toEqual({
+        tool: 'bash',
+        at: 2_000,
+        permissionID: 'per_1',
+      });
+      expect(board.formatForPrompt('parent-1')).toContain(
+        'Waiting: permission for bash',
+      );
+    });
+
+    test('re-stamping the same prompt does not churn the record', () => {
+      const board = runningLane();
+      const first = board.markAwaitingPermission('ses_1', {
+        tool: 'bash',
+        permissionID: 'per_1',
+        now: 2_000,
+      });
+      const second = board.markAwaitingPermission('ses_1', {
+        tool: 'bash',
+        permissionID: 'per_1',
+        now: 9_000,
+      });
+      expect(second).toBe(first);
+      expect(second?.awaitingPermission?.at).toBe(2_000);
+    });
+
+    test('never stamps a settled lane', () => {
+      const board = runningLane();
+      board.updateStatus({ taskID: 'ses_1', state: 'completed' });
+      expect(
+        board.markAwaitingPermission('ses_1', { tool: 'bash', now: 2_000 })
+          ?.awaitingPermission,
+      ).toBeUndefined();
+      expect(
+        board.markAwaitingPermission('ses_missing', { tool: 'bash' }),
+      ).toBeUndefined();
+    });
+
+    test('an empty tool name is not a stamp', () => {
+      const board = runningLane();
+      expect(
+        board.markAwaitingPermission('ses_1', { tool: '   ' })
+          ?.awaitingPermission,
+      ).toBeUndefined();
+    });
+
+    test('the reply clears the stamp', () => {
+      const board = runningLane();
+      board.markAwaitingPermission('ses_1', {
+        tool: 'bash',
+        permissionID: 'per_1',
+        now: 2_000,
+      });
+      expect(
+        board.clearAwaitingPermission('ses_1', { permissionID: 'per_1' })
+          ?.awaitingPermission,
+      ).toBeUndefined();
+    });
+
+    test('a reply to a superseded prompt does not clear the current one', () => {
+      const board = runningLane();
+      board.markAwaitingPermission('ses_1', {
+        tool: 'bash',
+        permissionID: 'per_2',
+        now: 2_000,
+      });
+      expect(
+        board.clearAwaitingPermission('ses_1', { permissionID: 'per_1' })
+          ?.awaitingPermission?.tool,
+      ).toBe('bash');
+      // An id-less reply is still allowed to clear, so no stamp can get stuck.
+      expect(
+        board.clearAwaitingPermission('ses_1')?.awaitingPermission,
+      ).toBeUndefined();
+    });
+
+    test('real output clears the stamp (missed reply self-heals)', () => {
+      const board = runningLane();
+      board.markAwaitingPermission('ses_1', { tool: 'bash', now: 2_000 });
+      const beat = board.recordActivity('ses_1', 3_000);
+      expect(beat?.awaitingPermission).toBeUndefined();
+      expect(beat?.lastActivityAt).toBe(3_000);
+      expect(board.formatForPrompt('parent-1')).not.toContain('Waiting:');
+    });
+
+    test('a busy poll does NOT clear the stamp (it answers nothing)', () => {
+      const board = runningLane();
+      board.markAwaitingPermission('ses_1', { tool: 'bash', now: 2_000 });
+      expect(
+        board.markRunningFromLiveSession('ses_1', 3_000)?.awaitingPermission
+          ?.tool,
+      ).toBe('bash');
+    });
+
+    test('every terminal transition drops the stamp', () => {
+      for (const finish of [
+        (board: BackgroundJobBoard) =>
+          board.updateStatus({ taskID: 'ses_1', state: 'error' }),
+        (board: BackgroundJobBoard) => board.markStopped('ses_1', 'stopped'),
+        (board: BackgroundJobBoard) => board.markCancelled('ses_1', 'cancel'),
+      ]) {
+        const board = runningLane();
+        board.markAwaitingPermission('ses_1', { tool: 'bash', now: 2_000 });
+        finish(board);
+        expect(board.get('ses_1')?.awaitingPermission).toBeUndefined();
+      }
+    });
+
+    test('a relaunch starts without either label', () => {
+      const board = runningLane();
+      board.markAwaitingPermission('ses_1', { tool: 'bash', now: 2_000 });
+      board.updateStatus({ taskID: 'ses_1', state: 'error' });
+      board.markCancelledByUser('ses_1', 'stop it', 3_000);
+      const relaunched = board.registerLaunch({
+        taskID: 'ses_1',
+        parentSessionID: 'parent-1',
+        agent: 'fixer',
+        description: 'fix the parser',
+        now: 4_000,
+      });
+      expect(relaunched.awaitingPermission).toBeUndefined();
+      expect(relaunched.cancelledByUser).toBeUndefined();
+    });
+
+    test('markCancelledByUser labels without touching the terminal state', () => {
+      const board = runningLane();
+      board.updateStatus({
+        taskID: 'ses_1',
+        state: 'error',
+        resultSummary: 'MessageAbortedError',
+      });
+      const labelled = board.markCancelledByUser(
+        'ses_1',
+        ' wrong  files ',
+        5_000,
+      );
+      expect(labelled).toMatchObject({
+        state: 'error',
+        resultSummary: 'MessageAbortedError',
+        terminalUnreconciled: true,
+        cancelledByUser: { at: 5_000, reason: 'wrong files' },
+      });
+
+      const prompt = board.formatForPrompt('parent-1');
+      expect(prompt).toContain('Stopped by: the user');
+      expect(prompt).toContain('wrong files');
+      expect(prompt).toContain('task_revive');
+    });
+
+    test('the label never overwrites an orchestrator-owned cancellation', () => {
+      const board = runningLane();
+      const lease = board.acquireCancellationLease('ses_1', 1);
+      board.markCancelled('ses_1', 'obsolete', 4_000, {
+        force: true,
+        expectedGeneration: 1,
+        cancellationLease: lease,
+      });
+      board.releaseLease(lease as NonNullable<typeof lease>);
+      expect(board.get('ses_1')?.cancellationRequested).toBe(true);
+
+      expect(
+        board.markCancelledByUser('ses_1', 'mine', 5_000)?.cancelledByUser,
+      ).toBeUndefined();
+      expect(board.formatForPrompt('parent-1')).not.toContain('Stopped by:');
+    });
+
+    test('a duplicated intent cannot relabel or restate an already labelled lane', () => {
+      const board = runningLane();
+      board.updateStatus({ taskID: 'ses_1', state: 'error' });
+      board.markCancelledByUser('ses_1', 'first', 5_000);
+      expect(
+        board.markCancelledByUser('ses_1', 'second', 6_000)?.cancelledByUser,
+      ).toEqual({ at: 5_000, reason: 'first' });
+      expect(board.markCancelledByUser('ses_missing')).toBeUndefined();
+    });
+
+    test('a reasonless stop still renders the action, byte-stably', () => {
+      const board = runningLane();
+      board.updateStatus({ taskID: 'ses_1', state: 'error' });
+      board.markCancelledByUser('ses_1', undefined, 5_000);
+      const first = board.formatForPrompt('parent-1');
+      const second = board.formatForPrompt('parent-1');
+      expect(first).toBe(second);
+      expect(first).toContain('Stopped by: the user, from a second terminal');
+      expect(first).not.toContain('undefined');
+    });
+  });
 });

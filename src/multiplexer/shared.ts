@@ -14,6 +14,25 @@ export function quoteShellArg(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Prefix a pane title with the lane alias the Background Job Board assigned.
+ *
+ * The alias (`fix-1`) is the handle every other surface uses — the board the
+ * orchestrator reads, `omo lanes list`, `task_message`, `task_cancel` — so a
+ * pane whose title only shows the session's own subject leaves the user
+ * mapping panes to lanes by hand. Idempotent, and a no-op when the alias is
+ * unknown (a pane can be spawned before the board has registered the launch).
+ */
+export function decoratePaneTitle(
+  title: string,
+  alias: string | undefined,
+): string {
+  const prefix = alias?.trim();
+  if (!prefix) return title;
+  if (title === prefix || title.startsWith(`${prefix} · `)) return title;
+  return `${prefix} · ${title}`;
+}
+
 /** Normalize Windows backslashes to / so sh -lc (MSYS2/Git Bash) doesn't treat them as escape chars. */
 export function normalizePathForShell(directory: string): string {
   return process.platform === 'win32'

@@ -103,6 +103,30 @@ describe('gracefulClosePane', () => {
   });
 });
 
+describe('decoratePaneTitle', () => {
+  test('prefixes the lane alias so panes match the board and omo lanes', async () => {
+    const { decoratePaneTitle } = await importShared();
+    expect(decoratePaneTitle('Fix the parser', 'fix-1')).toBe(
+      'fix-1 · Fix the parser',
+    );
+  });
+
+  test('is a no-op without an alias (pane may precede registration)', async () => {
+    const { decoratePaneTitle } = await importShared();
+    for (const alias of [undefined, '', '   ']) {
+      expect(decoratePaneTitle('Subagent', alias)).toBe('Subagent');
+    }
+  });
+
+  test('is idempotent, so a respawn does not stack prefixes', async () => {
+    const { decoratePaneTitle } = await importShared();
+    expect(decoratePaneTitle('fix-1 · Subagent', 'fix-1')).toBe(
+      'fix-1 · Subagent',
+    );
+    expect(decoratePaneTitle('fix-1', 'fix-1')).toBe('fix-1');
+  });
+});
+
 describe('buildOpencodeAttachCommand', () => {
   test('quotes an absolute executable containing spaces and apostrophes', async () => {
     const { buildOpencodeAttachCommand } = await importShared();

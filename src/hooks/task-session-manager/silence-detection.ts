@@ -265,6 +265,25 @@ interface LaneTracking {
   lastProbeAt?: number;
 }
 
+/**
+ * Is this lane waiting on a human rather than frozen?
+ *
+ * Two sources, both needed. `hasInputWait` is upstream's input-wait tracker,
+ * which by design only follows ORCHESTRATOR sessions (`shouldManageSession`),
+ * so for a background child it always answers false. The board stamp
+ * (`awaitingPermission`) is the child-side half, written by the event router
+ * from this lane's own `permission.updated`.
+ */
+function awaitsHuman(
+  options: SilenceMonitorOptions,
+  job: BackgroundJobRecord,
+): boolean {
+  return (
+    job.awaitingPermission !== undefined ||
+    options.hasInputWait?.(job.taskID) === true
+  );
+}
+
 export function createSilenceMonitor(
   options: SilenceMonitorOptions,
 ): SilenceMonitor {
@@ -347,11 +366,12 @@ export function createSilenceMonitor(
       return;
     }
 
-    if (options.hasInputWait?.(job.taskID)) {
+    if (awaitsHuman(options, job)) {
       log('[task-session-manager] silence: awaiting user input', {
         taskID: job.taskID,
         alias: job.alias,
         silentMs,
+        permissionTool: job.awaitingPermission?.tool,
       });
       return;
     }
@@ -376,7 +396,7 @@ export function createSilenceMonitor(
     if (after?.state !== 'running' || after.generation !== job.generation) {
       return;
     }
-    if (options.hasInputWait?.(job.taskID)) return;
+    if (awaitsHuman(options, after)) return;
 
     const at = now();
     const progress = captureLaneProgress(result.messages, at);

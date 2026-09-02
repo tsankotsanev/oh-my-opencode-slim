@@ -348,6 +348,54 @@ describe('silence detection: exemptions', () => {
     });
   });
 
+  test('a CHILD lane stamped with an open permission is never probed', async () => {
+    // The upstream input-wait tracker only follows orchestrator sessions, so
+    // for a child the exemption has to come from its own board stamp.
+    const time = clock(LAUNCH_AT);
+    const fixture = createHarness({
+      status: busyStatus,
+      time,
+      probeResult: { messages: [assistantMessage({ text: 'x' })] },
+    });
+    fixture.board.markAwaitingPermission('child-1', {
+      tool: 'bash',
+      now: LAUNCH_AT,
+    });
+
+    await pass(fixture, time, LAUNCH_AT);
+    await pass(fixture, time, LAUNCH_AT + 10 * STALE_AFTER_MS);
+
+    expect(fixture.probe).not.toHaveBeenCalled();
+    expect(fixture.board.get('child-1')).toMatchObject({
+      state: 'running',
+      statusUncertain: false,
+      awaitingPermission: { tool: 'bash' },
+    });
+  });
+
+  test('the stamp stops exempting the lane once the permission is answered', async () => {
+    const time = clock(LAUNCH_AT);
+    const fixture = createHarness({
+      status: busyStatus,
+      time,
+      probeResult: { messages: [assistantMessage({ text: 'x' })] },
+    });
+    fixture.board.markAwaitingPermission('child-1', {
+      tool: 'bash',
+      now: LAUNCH_AT,
+    });
+    await pass(fixture, time, LAUNCH_AT + 10 * STALE_AFTER_MS);
+    expect(fixture.probe).not.toHaveBeenCalled();
+
+    fixture.board.clearAwaitingPermission('child-1');
+    await pass(fixture, time, LAUNCH_AT + 20 * STALE_AFTER_MS);
+
+    expect(fixture.probe).toHaveBeenCalledTimes(1);
+    expect(fixture.board.get('child-1')).toMatchObject({
+      statusUncertain: true,
+    });
+  });
+
   test('disabled silence detection never probes or flags', async () => {
     const time = clock(LAUNCH_AT);
     const fixture = createHarness({

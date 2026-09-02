@@ -31,6 +31,24 @@ The CLI follows a command pattern with two primary commands:
 - **background-subagents.ts**: Shell integration for OpenCode background subagents (persistent agent processes)
 - **companion.ts**: Desktop companion binary installation and management
 
+### Lane Control (`lanes/`)
+Zero-token control surface for the Background Job Board's background lanes,
+reached from a SECOND terminal while one long-lived orchestrator keeps running.
+Every state change is a direct SDK call to the OpenCode server, never a model
+turn.
+- **lanes/index.ts**: Entry point; resolves `--dir`, injects `LanesDeps` (IO, clock, SDK client factory, file seams), and turns any throw into one line plus exit 1
+- **lanes/args.ts**: Pure, total argument parser (`list`/`show`/`stop`/`say`, `--dir/--server/-n/--reason/--force/--json`); `revive` is a reserved subcommand that points at `task_revive`
+- **lanes/board.ts**: READ-ONLY view of the lane mirror (`src/utils/lane-mirror.ts`), selector resolution (session id beats alias; a shared alias across two orchestrators is reported ambiguous, never guessed)
+- **lanes/server.ts**: Server discovery (`--server` → sidecar → `$OMO_OPENCODE_SERVER_URL`) with sidecar validation (dead pid / foreign directory / cold heartbeat), the minimal `LaneClient` SDK surface, dynamic SDK import, and error formatting
+- **lanes/commands.ts**: The four commands and all safety refusals — orchestrator-abort guards, pre-abort liveness check, intent-before-abort ordering, post-abort verification, cross-server active check, and the never-forceable agent rule (probe A2)
+
+**Import rule:** nothing under `src/cli/lanes/` imports from `src/hooks/`.
+Shared vocabulary (mirror paths/shapes, intent format, server-URL resolution,
+`withAgent`) lives in `src/utils/`, which keeps the board class and the hook
+runtime out of the CLI bundle (verified against `dist/cli/index.js`). The one
+pre-existing `src/cli/` → `src/hooks/` edge, `install.ts` →
+`auto-update-checker/skill-sync`, is install-time only.
+
 ## Flow
 
 ### Command Flow: CLI Entry Point
@@ -169,3 +187,23 @@ bunx oh-my-opencode-slim doctor [OPTIONS]
 - Preset existence and configuration
 - JSON schema validation
 - File existence and permissions
+
+### `lanes` Command Group
+Inspect and steer background subagent lanes of a running server, at zero token
+cost. Also exposed through the shorter `omo` bin alias.
+
+**Usage:**
+```bash
+omo lanes [list]                     # lanes recorded for this project (no server needed)
+omo lanes show <alias|ses_id> [-n N] # tail of a lane's transcript
+omo lanes stop <alias|ses_id> [--reason "…"]
+omo lanes say  <alias|ses_id> "<text>"
+```
+
+**Options:** `--dir <path>`, `--server <url>`, `-n/--count <n>`, `--reason "<text>"`, `--force`, `--json`, `-h/--help`
+
+**Behaviour notes:**
+- `list` reads only the mirror; every other command re-checks the live server first
+- `stop` writes its intent BEFORE aborting (the plugin claims it to label the record as the user's cancellation), then verifies the session went idle
+- `say` always carries the lane's own agent; `--force` never waives that
+- Refusal table and the multi-server caveat: `docs/background-orchestration.md#controlling-lanes-from-a-second-terminal`

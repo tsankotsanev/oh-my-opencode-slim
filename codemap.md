@@ -30,7 +30,8 @@ This codemap covers the plugin repository itself and excludes the nested `openco
 |---|---|---|
 | `src/` | Main application surface that composes plugin bootstrap, runtime model chains, hook orchestration, task-session aliasing, and installer-facing code. | [View Map](src/codemap.md) |
 | `src/agents/` | Agent factory layer for orchestrator and specialists (incl. dynamic `councillor-<name>` agents from council presets), including prompt/model overrides, task-rejection instruction, display-name normalization, MCP assignment, and permission shaping. | [View Map](src/agents/codemap.md) |
-| `src/cli/` | Installer, config editing, provider preset generation, and built-in skill installation. | [View Map](src/cli/codemap.md) |
+| `src/cli/` | Installer, config editing, provider preset generation, built-in skill installation, and the `omo lanes` lane-control command group. | [View Map](src/cli/codemap.md) |
+| `src/cli/lanes/` | `omo lanes list/show/stop/say`: zero-token inspection and steering of background subagent lanes from a second terminal over direct SDK calls. | [View Map](src/cli/codemap.md) |
 | `src/config/` | Configuration schema, layered loaders, preset merging, compatibility migrations, constant tables, the `RuntimeConfig` runtime-state singleton, and agent/MCP policy helpers. | [View Map](src/config/codemap.md) |
 
 | `src/hooks/` | Aggregated runtime hook surface: prompt transforms, cache-safe injection, recovery logic, task-session aliasing, cache monitoring, orchestrator wake, nudges, and lifecycle policies. | [View Map](src/hooks/codemap.md) |

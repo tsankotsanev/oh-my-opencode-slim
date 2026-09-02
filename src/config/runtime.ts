@@ -84,6 +84,7 @@ const DEFAULT_BACKGROUND_JOBS: BackgroundJobsConfig = {
   abortGraceMs: 10_000,
   silenceDetection: true,
   staleAfterMs: 300_000,
+  laneControl: true,
   concurrency: {
     defaultConcurrency: 0,
     providerConcurrency: {},
