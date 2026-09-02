@@ -5,7 +5,6 @@ import {
 } from '@opencode-ai/plugin';
 import type { BackgroundJobStore } from '../utils/background-job-store';
 import { getRuntimeSessionStatusSnapshot } from '../utils/session-runtime-status';
-import type { TaskActivityTracker } from './task-activity';
 import { observationFromSnapshot, summarizeTaskStatus } from './task-policy';
 
 const z = tool.schema;
@@ -14,7 +13,6 @@ const ACTIVE_STATES = new Set(['busy', 'running', 'retry']);
 export function createTaskStatusTool(options: {
   input: PluginInput;
   backgroundJobBoard: BackgroundJobStore;
-  activityTracker?: TaskActivityTracker;
   now?: () => number;
   statusTimeoutMs?: number;
 }): Record<'task_status', ToolDefinition> {
@@ -44,10 +42,12 @@ export function createTaskStatusTool(options: {
       });
       const observation = observationFromSnapshot(snapshot, job.taskID);
       const now = options.now?.() ?? Date.now();
+      // The board record is the only activity clock. `lastActivityAt` is
+      // observed child OUTPUT; `lastLiveBusyAt` is the weaker "host still
+      // calls it busy" reading kept as a floor for lanes that have not
+      // emitted anything yet.
       const lastActivityAt =
-        options.activityTracker?.lastActivityAt(job.taskID) ??
-        job.lastLiveBusyAt ??
-        job.runStartedAt;
+        job.lastActivityAt ?? job.lastLiveBusyAt ?? job.runStartedAt;
       const report = summarizeTaskStatus(job, observation, lastActivityAt, now);
 
       const details = [

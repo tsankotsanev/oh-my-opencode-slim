@@ -38,7 +38,9 @@ export function createV1InterviewSessionRuntime(
       // session has no parentID (interviews always run on the user's own
       // top-level session). An unresolvable child session yields no `agent`
       // field rather than a guess.
-      const agent = await resolveSessionAgent(client, sessionID);
+      const agent = await resolveSessionAgent(client, sessionID, {
+        directory: ctx.directory,
+      });
       await client.session.prompt({
         path: { id: sessionID },
         body: withAgent(

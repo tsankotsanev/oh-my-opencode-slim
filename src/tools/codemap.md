@@ -28,7 +28,7 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
 | Tool Family | Purpose | Key Components |
 |------------|---------|----------------|
 | **Task Management** | Background task communication, cancellation, status, results, revival, and HITL continuation control | `task-message.ts`, `cancel-task.ts`, `task-status.ts`, `task-result.ts`, `task-revive.ts`, `wait-for-user.ts` |
-| **Task Policy & Activity** | Shared live-status policy and activity tracking consumed by `task_status` and event wiring | `task-policy.ts` (`summarizeTaskStatus`), `task-activity.ts` (`TaskActivityTracker`) |
+| **Task Policy** | Shared live-status policy consumed by `task_status`; the activity clock and stuck verdict live on the job board (`lastActivityAt` / `silenceDetectedAt`), not here | `task-policy.ts` (`summarizeTaskStatus`), `task-activity.ts` (`resolveEventSessionID` only) |
 | **ACP Integration** | External agent protocol execution | `acp-run.ts`, ACP client implementation |
 | **Code Intelligence** | AST-based code manipulation | `ast-grep/` directory, `tools.ts` |
 | **Web Fetching** | Intelligent web content retrieval | `smartfetch/` directory, `tool.ts` |
@@ -112,8 +112,12 @@ Each tool is implemented as a factory function that returns a `ToolDefinition` r
    ├─> Reads the bounded live session-status snapshot (session-runtime-status)
    ├─> summarizeTaskStatus() (task-policy.ts) prefers the live-confirmed host
    │   status; board state is only reported with explicit uncertainty
-   └─> possibly_stuck requires a live-confirmed busy/retry signal beyond the
-       STUCK_IDLE_THRESHOLD_MS idle threshold
+   ├─> idle_for_seconds comes from the board record only:
+   │   job.lastActivityAt ?? job.lastLiveBusyAt ?? job.runStartedAt
+   └─> possibly_stuck = live-confirmed busy/retry AND the board's own silence
+       flag (job.silenceDetectedAt), so the tool inherits silence detection's
+       threshold and its tool-executing / retry / input-wait exemptions
+       instead of applying a second idle threshold of its own
 ```
 
 ### ACP Agent Execution Flow

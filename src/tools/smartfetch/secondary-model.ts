@@ -1,10 +1,6 @@
 import type { PluginInput } from '@opencode-ai/plugin';
 import { getClient } from '../../utils/opencode-client';
-import {
-  FALLBACK_HELPER_SESSION_AGENT,
-  resolveSessionAgent,
-  withAgent,
-} from '../../utils/prompt-agent';
+import { FALLBACK_HELPER_SESSION_AGENT } from '../../utils/prompt-agent';
 import { abortSessionWithTimeout } from '../../utils/session';
 import { MAX_MODEL_CONTENT_CHARS } from './constants';
 import type { CachedFetch, SecondaryModel } from './types';
@@ -336,51 +332,48 @@ async function runSecondaryModel(
       (toolIDs || []).map((id: string) => [id, false]),
     );
 
-    // This helper session is created by the plugin moments earlier and is
-    // deleted in the `finally` below: it has no history, so there is no
-    // "current agent" to preserve (hence `probe: false` — and it is treated
-    // as plugin-owned even when created with `parentID` for accounting). The
-    // agent must still be named: omitting it lets OpenCode resolve its default
-    // primary and durably rewrite the session agent
-    // (docs/agents/subagent-probe-results.md probe A2).
-    //
-    // `build` rather than the orchestrator on purpose: a message tagged
-    // `orchestrator` makes the task-session-manager adopt this throwaway
-    // session as a managed orchestrator session
-    // (`registerSessionAsOrchestrator`), which then attracts phase reminders,
-    // post-tool nudges, background-job-board injection, companion busy/idle
-    // flips, and the orchestrator system prompt on every fetch.
-    const agent = await resolveSessionAgent(client, sessionId, {
-      assumeTopLevel: true,
-      probe: false,
-      fallbackAgent: FALLBACK_HELPER_SESSION_AGENT,
-    });
-
     const { variant, ...modelOnly } = model;
     promptPromise = client.session.prompt({
       path: { id: sessionId },
       query: { directory },
-      body: withAgent(
-        {
-          model: modelOnly,
-          // The v1 runtime reads the variant from the body top level and
-          // strips unknown keys from `model`; the SDK type omits it, so
-          // spread it through the body shape directly.
-          ...(variant ? { variant } : {}),
-          system:
-            'Answer only from the supplied content. Do not use tools or outside knowledge.',
-          tools: disabledTools,
-          parts: [
-            {
-              // `as const` because the literal is no longer in a contextually
-              // typed position: withAgent() would widen `type` to string.
-              type: 'text' as const,
-              text: buildPrompt(truncatedContent, effectivePrompt),
-            },
-          ],
-        },
-        agent,
-      ),
+      body: {
+        // This helper session is created by the plugin moments earlier and is
+        // deleted in the `finally` below: it has no history, so there is no
+        // "current agent" to preserve and nothing to resolve. The agent must
+        // still be NAMED: omitting it lets OpenCode resolve its default
+        // primary and durably rewrite the session agent
+        // (docs/agents/subagent-probe-results.md probe A2).
+        //
+        // `build` rather than the orchestrator on purpose: a message tagged
+        // `orchestrator` makes the task-session-manager adopt this throwaway
+        // session as a managed orchestrator session
+        // (`registerSessionAsOrchestrator`), which then attracts phase
+        // reminders, post-tool nudges, background-job-board injection,
+        // companion busy/idle flips, and the orchestrator system prompt on
+        // every fetch.
+        //
+        // Named inline rather than through `resolveSessionAgent(..., { probe:
+        // false, assumeTopLevel: true, fallbackAgent })`, which could only
+        // ever return this same constant: the ceremony bought an await and
+        // obscured the fact that the value is fixed. NOTE: a user who
+        // disables the `build` agent in opencode.json breaks this prompt —
+        // see docs/configuration.md.
+        agent: FALLBACK_HELPER_SESSION_AGENT,
+        model: modelOnly,
+        // The v1 runtime reads the variant from the body top level and
+        // strips unknown keys from `model`; the SDK type omits it, so
+        // spread it through the body shape directly.
+        ...(variant ? { variant } : {}),
+        system:
+          'Answer only from the supplied content. Do not use tools or outside knowledge.',
+        tools: disabledTools,
+        parts: [
+          {
+            type: 'text' as const,
+            text: buildPrompt(truncatedContent, effectivePrompt),
+          },
+        ],
+      },
     });
     const result = await Promise.race([
       promptPromise,

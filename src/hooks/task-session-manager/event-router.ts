@@ -221,6 +221,96 @@ function activityEventSessionID(input: {
     : undefined;
 }
 
+/**
+ * How many injected user-message ids to remember per lane.
+ *
+ * Only enough to cover the part events of the messages an operator could have
+ * pushed into one silence window; the set is per lane and cleared on session
+ * deletion, so it cannot grow with session count either.
+ */
+const INJECTED_USER_MESSAGE_MEMORY = 8;
+
+/**
+ * Per-board memory of user messages written INTO a lane rather than produced
+ * by it, keyed the same way as the generation fences.
+ */
+const injectedUserMessages = new WeakMap<object, Map<string, Set<string>>>();
+
+function injectedUserMessageMap(
+  backgroundJobBoard: BackgroundJobStore,
+): Map<string, Set<string>> {
+  const key = backgroundJobBoard as object;
+  const existing = injectedUserMessages.get(key);
+  if (existing) return existing;
+  const created = new Map<string, Set<string>>();
+  injectedUserMessages.set(key, created);
+  return created;
+}
+
+/** Message id an activity event belongs to, across the three event shapes. */
+function activityEventMessageID(input: {
+  event: { type: string; properties?: Record<string, unknown> };
+}): string | undefined {
+  const properties = input.event.properties;
+  if (!properties) return undefined;
+  if (input.event.type === 'message.updated') {
+    const info = isRecord(properties.info) ? properties.info : undefined;
+    return typeof info?.id === 'string' && info.id ? info.id : undefined;
+  }
+  const direct = properties.messageID;
+  if (typeof direct === 'string' && direct) return direct;
+  const part = isRecord(properties.part) ? properties.part : undefined;
+  return typeof part?.messageID === 'string' && part.messageID
+    ? part.messageID
+    : undefined;
+}
+
+/**
+ * True when this activity event describes a message written INTO the lane
+ * instead of output produced BY it.
+ *
+ * `task_message` (and the planned `omo lanes say`) prompt a child directly,
+ * which makes the host emit `message.updated` for the new user message plus
+ * part events for its text. Counting those as lane activity would let an
+ * operator poking a frozen child silently clear its silence flag and buy it
+ * another full silence window — the exact opposite of what asking a hung lane
+ * a question should do. The lane's own reply carries a different message id
+ * and still counts, so a lane that genuinely wakes up is revived normally.
+ */
+function isInjectedUserMessageEvent(
+  backgroundJobBoard: BackgroundJobStore,
+  input: { event: { type: string; properties?: Record<string, unknown> } },
+  sessionID: string,
+): boolean {
+  const messageID = activityEventMessageID(input);
+  if (input.event.type === 'message.updated') {
+    const info = isRecord(input.event.properties?.info)
+      ? input.event.properties.info
+      : undefined;
+    if (info?.role !== 'user') return false;
+    if (messageID) {
+      const byLane = injectedUserMessageMap(backgroundJobBoard);
+      const known = byLane.get(sessionID) ?? new Set<string>();
+      known.add(messageID);
+      // Bounded FIFO: Set preserves insertion order.
+      while (known.size > INJECTED_USER_MESSAGE_MEMORY) {
+        const oldest = known.values().next();
+        if (oldest.done) break;
+        known.delete(oldest.value);
+      }
+      byLane.set(sessionID, known);
+    }
+    return true;
+  }
+
+  if (!messageID) return false;
+  return (
+    injectedUserMessageMap(backgroundJobBoard)
+      .get(sessionID)
+      ?.has(messageID) === true
+  );
+}
+
 function isCurrentSessionObservation(
   backgroundJobBoard: BackgroundJobStore,
   observation: SessionEventObservation,
@@ -343,7 +433,14 @@ export async function handleEvent(
   // and returns from below. One board lookup; unknown sessions no-op.
   if (ACTIVITY_EVENT_TYPES.has(input.event.type)) {
     const activeSessionID = activityEventSessionID(input);
-    if (activeSessionID) {
+    if (
+      activeSessionID &&
+      !isInjectedUserMessageEvent(
+        deps.backgroundJobBoard,
+        input,
+        activeSessionID,
+      )
+    ) {
       deps.backgroundJobBoard.recordActivity(
         activeSessionID,
         eventActivityAt(input, deps.options.now?.() ?? Date.now()),
@@ -449,6 +546,7 @@ export async function handleEvent(
     deps.revivedRunTracker?.dispose();
     deps.retainedBoardSnapshots.clear();
     eventFenceMap(deps.backgroundJobBoard).clear();
+    injectedUserMessageMap(deps.backgroundJobBoard).clear();
     const idleSessionIds = deps.idleReconciler.clearAllTimers();
     // Local-only: drop idle tokens. Process-global wait_for_user stays armed.
     const waitSessionIDs = new Set([
@@ -624,33 +722,36 @@ export async function handleEvent(
         ) {
           return;
         }
-        // A broken wire is not a failed task. The child's stream died; the
-        // work it was doing has no known outcome, and the session may still
-        // be alive on the host. Recording terminal `error` here would tell
-        // the orchestrator a failure it would act on, so surface recoverable
-        // uncertainty instead and let liveness reconciliation (plus silence
-        // detection) settle what actually happened.
-        if (isTransportError(props?.error)) {
-          const uncertain = deps.backgroundJobBoard.markStatusUncertain(
-            sessionId,
-            transportSessionErrorReason(props?.error),
-            observation?.generation,
-          );
-          log('[task-session-manager] child transport error kept recoverable', {
-            sessionID: sessionId,
-            alias: uncertain?.alias,
-            state: uncertain?.state,
-          });
-          return;
-        }
+        // A broken wire is not a failed task: the child's stream died and
+        // the work it was doing has no known outcome. That distinction is
+        // carried in the SUMMARY, not the state.
+        //
+        // The state stays `error` on purpose. `statusUncertain` was tried and
+        // regressed recoverability: session.error ends the turn, so the child
+        // goes idle, stop-confirmation overwrites the reason and confirms
+        // `stopped` after its 5s grace — and a stopped record is not
+        // revivable (`isReviveableRetainedJob` excludes it, and
+        // `resolveRecoverable` requires `running`), so the transport cause was
+        // lost along with the ability to resume the same session. An `error`
+        // record IS revivable in place, which is exactly the affordance the
+        // orchestrator needs here.
+        const transport = isTransportError(props?.error);
         const updated = deps.backgroundJobBoard.updateStatus({
           taskID: sessionId,
           state: 'error',
           expectedGeneration: observation?.generation,
-          resultSummary:
-            (props?.error as { message?: string } | undefined)?.message ??
-            'Session error',
+          resultSummary: transport
+            ? transportSessionErrorReason(props?.error)
+            : ((props?.error as { message?: string } | undefined)?.message ??
+              'Session error'),
         });
+        if (transport) {
+          log('[task-session-manager] child transport error recorded', {
+            sessionID: sessionId,
+            alias: updated?.alias,
+            resultSummary: updated?.resultSummary,
+          });
+        }
         if (updated) deps.revivedRunTracker?.onTerminal(updated);
       }
     }
@@ -804,4 +905,5 @@ export async function handleEvent(
     sessionID: sessionId,
   });
   eventFenceMap(deps.backgroundJobBoard).delete(sessionId);
+  injectedUserMessageMap(deps.backgroundJobBoard).delete(sessionId);
 }

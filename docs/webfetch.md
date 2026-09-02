@@ -107,6 +107,20 @@ The secondary model is called only when all of these are true:
 If the secondary model fails (timeout, error, empty response), `webfetch`
 returns the raw fetched content as a graceful fallback.
 
+**The throwaway session prompts as the `build` agent.** A prompt body must
+name an agent: omitting the field makes OpenCode resolve its own default
+primary and *durably rewrite the session's agent*
+(`docs/agents/subagent-probe-results.md` probe A2). `build` is used rather than
+`orchestrator` so the task-session-manager does not adopt this disposable
+session as a managed orchestrator session (which would attach phase reminders,
+board injection, and the orchestrator system prompt to every fetch).
+
+> **Caveat:** if you disable or remove the `build` agent in your
+> `opencode.json`, this helper prompt has no valid agent to run as and the
+> secondary-model step fails — `webfetch` then falls back to returning the raw
+> content, so extraction silently stops working. Keep `build` enabled if you
+> use `prompt`.
+
 ## Caching
 
 Fetches are cached in memory with an LRU cache (50 MiB max, 15-minute TTL).

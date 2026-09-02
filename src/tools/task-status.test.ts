@@ -66,7 +66,36 @@ describe('task_status', () => {
     );
   });
 
-  test('flags a busy child without recent activity as possibly stuck', async () => {
+  test('flags a busy child the board has marked silent as possibly stuck', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'implement',
+      now: 0,
+    });
+    // The board owns the verdict: silence detection already applied the
+    // threshold and the tool/retry/input-wait exemptions.
+    board.markSilenceDetected('ses_child1', 'no activity for 305s while busy', {
+      now: 305_000,
+    });
+    client = {
+      session: {
+        status: mock(async () => ({
+          data: { ses_child1: { type: 'busy' } },
+        })),
+      },
+    };
+    const { task_status } = makeTool({ board, now: () => 320_000 });
+    await expect(
+      task_status.execute({ task_id: 'ses_child1' }, {
+        sessionID: 'parent-1',
+      } as any),
+    ).resolves.toContain('possibly_stuck: true');
+  });
+
+  test('does not flag a busy child that is merely idle-looking to a raw timer', async () => {
     const board = new BackgroundJobBoard();
     board.registerLaunch({
       taskID: 'ses_child1',
@@ -82,12 +111,39 @@ describe('task_status', () => {
         })),
       },
     };
-    const { task_status } = makeTool({ board, now: () => 120_000 });
+    // Long past the old 120s tracker threshold, but the board never flagged
+    // it (streaming reply, long tool call, provider retry, permission wait).
+    const { task_status } = makeTool({ board, now: () => 900_000 });
+    const output = await task_status.execute({ task_id: 'ses_child1' }, {
+      sessionID: 'parent-1',
+    } as any);
+    expect(output).toContain('possibly_stuck: false');
+    expect(output).toContain('idle_for_seconds: 900');
+  });
+
+  test('reads idle seconds from the board activity clock', async () => {
+    const board = new BackgroundJobBoard();
+    board.registerLaunch({
+      taskID: 'ses_child1',
+      parentSessionID: 'parent-1',
+      agent: 'fixer',
+      description: 'implement',
+      now: 0,
+    });
+    board.recordActivity('ses_child1', 60_000);
+    client = {
+      session: {
+        status: mock(async () => ({
+          data: { ses_child1: { type: 'busy' } },
+        })),
+      },
+    };
+    const { task_status } = makeTool({ board, now: () => 100_000 });
     await expect(
       task_status.execute({ task_id: 'ses_child1' }, {
         sessionID: 'parent-1',
       } as any),
-    ).resolves.toContain('possibly_stuck: true');
+    ).resolves.toContain('idle_for_seconds: 40');
   });
 
   test('surfaces a failed status read as explicit uncertainty, not a confident board fallback', async () => {

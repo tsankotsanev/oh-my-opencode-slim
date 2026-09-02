@@ -208,7 +208,13 @@ function getCurrentReviveJob(
   return current;
 }
 
-function isReviveableRetainedJob(
+/**
+ * Whether a retained (non-cancelled-for-revive) record may be revived in
+ * place. Exported for tests that assert a specific terminal record stays
+ * revivable — notably a child whose transport died, which is recorded as
+ * `error` precisely so this predicate accepts it.
+ */
+export function isReviveableRetainedJob(
   job: NonNullable<
     ReturnType<TaskReviveToolOptions['backgroundJobBoard']['get']>
   >,

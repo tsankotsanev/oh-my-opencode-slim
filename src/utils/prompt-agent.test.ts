@@ -370,6 +370,10 @@ const V2_FLAT_HOST_PROMPTS = new Map<string, string>([
     'v2/session-submit.ts',
     'v2 flat host PromptInput ({ sessionID, text }) has no agent field; v2 agent selection goes through session.switchAgent',
   ],
+  [
+    'v2/client-shim.ts',
+    'adapter that translates v1 SDK calls into the v2 flat host API: its `s.prompt({ sessionID, text, delivery })` calls target v2 PromptInput, which has no agent field. FOLLOW-UP (docs/opencode-v2-compatibility.md): the shim currently DROPS body.agent when adapting v1 prompt/promptAsync and should call s.switchAgent when one is present.',
+  ],
 ]);
 
 /**
@@ -607,25 +611,24 @@ function findViolations(relativePath: string, rawSource: string): string[] {
   const source = maskNonCode(rawSource);
   const violations: string[] = [];
   const boundAliases = boundPromptAliasPattern(source);
-  const matchers: Array<{ pattern: RegExp; requireSessionReceiver: boolean }> =
-    [
-      { pattern: PROMPT_CALL_PATTERN, requireSessionReceiver: true },
-      { pattern: WRAPPER_CALL_PATTERN, requireSessionReceiver: false },
-      ...(boundAliases
-        ? [{ pattern: boundAliases, requireSessionReceiver: false }]
-        : []),
-    ];
+  // No receiver filter. A `/session/i.test(receiver)` guard used to live here
+  // and it hid a real prompt site: `src/v2/client-shim.ts` calls `s.prompt(`
+  // on a destructured host handle whose name says nothing about sessions.
+  // Any `<receiver>.prompt(` / `.promptAsync(` is scanned; files that legitimately
+  // cannot carry an agent are named in the allowlists above.
+  const matchers: RegExp[] = [
+    PROMPT_CALL_PATTERN,
+    WRAPPER_CALL_PATTERN,
+    ...(boundAliases ? [boundAliases] : []),
+  ];
 
-  for (const { pattern, requireSessionReceiver } of matchers) {
+  for (const pattern of matchers) {
     pattern.lastIndex = 0;
     let match = pattern.exec(source);
     while (match) {
-      const receiver = match[1] ?? '';
       const parenIndex = match.index + match[0].length - 1;
       const isDeclaration = /\bfunction\s*$/.test(source.slice(0, match.index));
-      const skip =
-        isDeclaration || (requireSessionReceiver && !/session/i.test(receiver));
-      if (!skip) {
+      if (!isDeclaration) {
         const args = extractCallArgs(source, parenIndex);
         const indirect = indirectBodyIdentifier(args);
         const isBareIdentifier = /^\s*[A-Za-z_$][\w$]*\s*$/.test(args);
@@ -800,10 +803,26 @@ describe('agent-less prompt regression guard', () => {
     ]);
   });
 
-  test('scanner ignores non-session receivers', () => {
+  test('scanner scans every receiver, not only session-shaped ones', () => {
+    // The receiver name is not evidence. A /session/i heuristic used to skip
+    // these and it hid src/v2/client-shim.ts's own prompt call site. Over-
+    // reporting an unrelated .prompt( is a loud, allowlistable failure;
+    // under-reporting a real one is a silent agent rewrite.
     expect(findViolations('fixture.ts', 'await ui.dialog.prompt({});')).toEqual(
-      [],
+      ['fixture.ts:1 - ui.dialog.prompt('],
     );
+  });
+
+  test('the v2 flat-host shim is allowlisted rather than filtered out', () => {
+    // Regression pin for the removed receiver filter: if client-shim.ts ever
+    // leaves the allowlist, the repo-wide scan above must report it instead
+    // of silently skipping it.
+    expect(V2_FLAT_HOST_PROMPTS.has('v2/client-shim.ts')).toBe(true);
+    const shimCall = 'return s.prompt({ sessionID, text });';
+    expect(findViolations('v2/client-shim.ts', shimCall)).toEqual([]);
+    expect(findViolations('somewhere-else.ts', shimCall)).toEqual([
+      'somewhere-else.ts:1 - s.prompt(',
+    ]);
   });
 
   test('every allowlisted file exists and carries a substantive reason', () => {

@@ -1,4 +1,6 @@
 import { describe, expect, mock, test } from 'bun:test';
+import { isReviveableRetainedJob } from '../../tools/task-revive';
+import { createTaskStatusTool } from '../../tools/task-status';
 import { BackgroundJobBoard } from '../../utils';
 import {
   isTransportError,
@@ -581,6 +583,105 @@ describe('silence detection: activity heartbeat wiring', () => {
     board.recordActivity('child-1', LAUNCH_AT + 5_000);
     expect(board.get('child-1')?.lastActivityAt).toBe(LAUNCH_AT + 10_000);
   });
+
+  test('a message injected INTO the lane is not lane activity', async () => {
+    const board = boardWithLane();
+    board.markSilenceDetected('child-1', 'no activity for 305s while busy', {
+      now: LAUNCH_AT + 305_000,
+      progress: { messageCount: 3, capturedAt: LAUNCH_AT + 305_000 },
+    });
+    const at = LAUNCH_AT + 400_000;
+    const deps = eventDeps(board, () => at);
+
+    // task_message / `omo lanes say` prompting a hung child: the host emits a
+    // user message plus its part events. None of it is output BY the lane.
+    await handleEvent(
+      {
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: { id: 'msg_user_1', sessionID: 'child-1', role: 'user' },
+          },
+        },
+      } as never,
+      deps,
+    );
+    await handleEvent(
+      {
+        event: {
+          type: 'message.part.delta',
+          properties: {
+            sessionID: 'child-1',
+            messageID: 'msg_user_1',
+            partID: 'prt_1',
+          },
+        },
+      } as never,
+      deps,
+    );
+    await handleEvent(
+      {
+        event: {
+          type: 'message.part.updated',
+          properties: {
+            part: {
+              sessionID: 'child-1',
+              messageID: 'msg_user_1',
+              id: 'prt_1',
+              type: 'text',
+            },
+          },
+        },
+      } as never,
+      deps,
+    );
+
+    const stillSilent = board.get('child-1');
+    expect(stillSilent?.statusUncertain).toBe(true);
+    expect(stillSilent?.silenceDetectedAt).toBe(LAUNCH_AT + 305_000);
+    expect(stillSilent?.lastStatusError).toBe(
+      'no activity for 305s while busy',
+    );
+    expect(stillSilent?.lastActivityAt).toBeUndefined();
+
+    // The lane's OWN reply carries a different message id and does revive it.
+    await handleEvent(
+      {
+        event: {
+          type: 'message.part.delta',
+          properties: {
+            sessionID: 'child-1',
+            messageID: 'msg_assistant_1',
+            partID: 'prt_2',
+          },
+        },
+      } as never,
+      deps,
+    );
+    expect(board.get('child-1')).toMatchObject({
+      statusUncertain: false,
+      lastActivityAt: at,
+    });
+  });
+
+  test('an assistant message.updated still counts as activity', async () => {
+    const board = boardWithLane();
+    const at = LAUNCH_AT + 30_000;
+
+    await handleEvent(
+      {
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: { id: 'msg_1', sessionID: 'child-1', role: 'assistant' },
+          },
+        },
+      } as never,
+      eventDeps(board, () => at),
+    );
+
+    expect(board.get('child-1')?.lastActivityAt).toBe(at);
+  });
 });
 
 describe('silence detection: child transport errors', () => {
@@ -635,7 +736,7 @@ describe('silence detection: child transport errors', () => {
     return board;
   }
 
-  test('a transport fault is recoverable uncertainty, not terminal error', async () => {
+  test('a transport fault stays revivable error, naming the cause', async () => {
     const board = laneBoard();
 
     await handleEvent(
@@ -652,11 +753,46 @@ describe('silence detection: child transport errors', () => {
     );
 
     const job = board.get('child-1');
-    expect(job?.state).toBe('running');
-    expect(job?.statusUncertain).toBe(true);
-    expect(job?.lastStatusError).toContain('lost its transport connection');
-    expect(job?.terminalUnreconciled).toBe(false);
-    expect(board.resolveReusable('parent-1', 'fix-1', 'fixer')).toBeUndefined();
+    if (!job) throw new Error('lane missing');
+    // `error`, not `statusUncertain`: statusUncertain leaves the record
+    // `running`, the child then goes idle, and stop-confirmation converts it
+    // to `stopped` after its grace — which is NOT revivable and loses the
+    // transport cause. `error` keeps the same session resumable in place.
+    expect(job.state).toBe('error');
+    expect(job.statusUncertain).toBe(false);
+    expect(job.resultSummary).toBe(
+      'Child session lost its transport connection (fetch failed); the task outcome is unknown.',
+    );
+    expect(isReviveableRetainedJob(job)).toBe(true);
+  });
+
+  test('a transport fault does not become an unrevivable stopped record', async () => {
+    const board = laneBoard();
+
+    await handleEvent(
+      {
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'child-1',
+            error: { code: 'ECONNRESET' },
+          },
+        },
+      } as never,
+      transportDeps(board),
+    );
+
+    // The child goes idle right after the error; stop-confirmation may only
+    // act on a `running` record, so the terminal error is already safe.
+    const stopped = board.markStopped(
+      'child-1',
+      'Background session stopped before a terminal task result was received.',
+      LAUNCH_AT + 10_000,
+    );
+    expect(stopped?.state).toBe('error');
+    expect(stopped?.resultSummary).toContain('lost its transport connection');
+    if (!stopped) throw new Error('lane missing');
+    expect(isReviveableRetainedJob(stopped)).toBe(true);
   });
 
   test('a genuine task failure is still terminal error', async () => {
@@ -796,5 +932,119 @@ describe('silence detection: pure helpers', () => {
     laneClock.set(LAUNCH_AT + 11_000);
     await monitor.observe(job, 'busy');
     expect(probe).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The board is the single activity clock.
+ *
+ * `task_status` used to read a separate in-memory tracker with its own event
+ * set and a flat 120s threshold, so it could call a lane stuck while the
+ * rendered job board called it running (and vice versa). Both now read the
+ * same record, which means the tool inherits the board's tool-executing and
+ * retry exemptions for free. These tests pin that agreement.
+ */
+describe('silence detection: task_status agrees with the board', () => {
+  async function agreement(fixture: {
+    board: BackgroundJobBoard;
+    at: number;
+  }): Promise<{ status: string; rendered: string }> {
+    const { task_status } = createTaskStatusTool({
+      // `session.status` present on the client, so the bounded read never
+      // falls back to the real getClient().
+      input: {
+        directory: '/test/project',
+        client: {
+          session: {
+            status: async () => ({ data: { 'child-1': { type: 'busy' } } }),
+          },
+        },
+      } as never,
+      backgroundJobBoard: fixture.board,
+      now: () => fixture.at,
+    });
+    const status = await task_status.execute({ task_id: 'child-1' }, {
+      sessionID: 'parent-1',
+    } as never);
+    return {
+      status: status as string,
+      rendered: fixture.board.formatForPrompt('parent-1') ?? '',
+    };
+  }
+
+  test('a streaming lane is running for both', async () => {
+    const time = clock(LAUNCH_AT);
+    const fixture = createHarness({
+      status: busyStatus,
+      time,
+      probeResult: { messages: [assistantMessage({ text: 'x' })] },
+    });
+
+    await pass(fixture, time, LAUNCH_AT);
+    let at = LAUNCH_AT;
+    for (; at <= LAUNCH_AT + 900_000; at += 60_000) {
+      fixture.board.recordActivity('child-1', at);
+      await pass(fixture, time, at);
+    }
+
+    const { status, rendered } = await agreement({ board: fixture.board, at });
+    expect(status).toContain('possibly_stuck: false');
+    expect(status).toContain('state: busy');
+    expect(rendered).not.toContain('status uncertain');
+    expect(rendered).not.toContain('Last seen');
+  });
+
+  test('a tool-executing lane is running for both', async () => {
+    const time = clock(LAUNCH_AT);
+    const fixture = createHarness({
+      status: busyStatus,
+      time,
+      probeResult: {
+        messages: [
+          assistantMessage({
+            text: 'running the suite',
+            tools: [{ name: 'bash', status: 'running' }],
+          }),
+        ],
+      },
+    });
+
+    await pass(fixture, time, LAUNCH_AT);
+    const at = LAUNCH_AT + STALE_AFTER_MS + 5_000;
+    await pass(fixture, time, at);
+
+    const { status, rendered } = await agreement({ board: fixture.board, at });
+    // The old flat timer would have called this stuck at 120s.
+    expect(status).toContain('possibly_stuck: false');
+    expect(rendered).not.toContain('status uncertain');
+    expect(rendered).not.toContain('Last seen');
+  });
+
+  test('a genuinely silent lane is flagged for both', async () => {
+    const time = clock(LAUNCH_AT);
+    const fixture = createHarness({
+      status: busyStatus,
+      time,
+      probeResult: {
+        messages: [
+          assistantMessage({
+            text: 'Reading the reconciliation module',
+            tools: [{ name: 'bash', status: 'completed' }],
+          }),
+        ],
+      },
+    });
+
+    await pass(fixture, time, LAUNCH_AT);
+    const at = LAUNCH_AT + STALE_AFTER_MS + 5_000;
+    await pass(fixture, time, at);
+
+    const { status, rendered } = await agreement({ board: fixture.board, at });
+    expect(status).toContain('possibly_stuck: true');
+    expect(status).toContain('state: busy');
+    expect(rendered).toContain('running, status uncertain');
+    expect(rendered).toContain(
+      'Last seen: Reading the reconciliation module (last tool: bash completed, 1 msg)',
+    );
   });
 });

@@ -5,9 +5,6 @@ import {
   runtimeSessionStatus,
 } from '../utils/session-runtime-status';
 
-/** A live child is reported possibly stuck after this much time without activity. */
-export const STUCK_IDLE_THRESHOLD_MS = 120_000;
-
 /**
  * Bounded, explicit observation of a tracked child's live session status.
  *
@@ -69,6 +66,10 @@ export function summarizeTaskStatus(
   lastActivityAt: number | undefined,
   now: number,
 ): TaskStatusReport {
+  // Both numbers below come from the board record, which is the single
+  // activity clock: silence detection owns the threshold and the
+  // tool-executing / retry / input-wait exemptions, so `task_status` and the
+  // rendered job board can never disagree about whether a lane is stuck.
   let state: string;
   let source: 'live' | 'board';
   let uncertain: boolean;
@@ -96,10 +97,17 @@ export function summarizeTaskStatus(
   );
   // possibly_stuck requires a live-confirmed busy/retry signal: an
   // uncertain board fallback must never report a positive stuck state.
+  //
+  // The verdict itself is the board's silence flag, not a second threshold
+  // applied here. That flag has already survived one bounded probe and the
+  // exemptions a raw idle timer cannot see: a lane executing a long tool, a
+  // provider retry, and a lane blocked on a human all emit nothing while
+  // being perfectly healthy, and each of them would trip a plain
+  // "idle for N seconds" comparison.
   const possiblyStuck =
     !uncertain &&
     (state === 'busy' || state === 'retry') &&
-    idleSeconds >= STUCK_IDLE_THRESHOLD_MS / 1000;
+    job.silenceDetectedAt !== undefined;
   return {
     state,
     source,

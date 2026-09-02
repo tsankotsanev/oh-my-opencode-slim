@@ -107,6 +107,16 @@ export interface ResolveSessionAgentOptions {
    * {@link FALLBACK_HELPER_SESSION_AGENT}.
    */
   fallbackAgent?: string;
+  /**
+   * Project directory for the probe reads, forwarded as `query.directory`.
+   *
+   * Every other `session.get`/`session.messages` call site in the repo passes
+   * it (`utils/session.ts`, `hooks/orchestrator-wake`, `tools/cancel-task`);
+   * omitting it makes a multi-directory host resolve the session against the
+   * wrong project and answer "not found", which here degrades silently into
+   * an unresolved agent.
+   */
+  directory?: string;
 }
 
 function normalizeAgentName(value: unknown): string | undefined {
@@ -216,14 +226,22 @@ export async function resolveSessionAgent(
 
   if (options.probe !== false && sessionId) {
     const sessionApi = client.session as {
-      get?: (args: { path: { id: string } }) => Promise<unknown>;
-      messages?: (args: { path: { id: string } }) => Promise<unknown>;
+      get?: (args: {
+        path: { id: string };
+        query?: { directory: string };
+      }) => Promise<unknown>;
+      messages?: (args: {
+        path: { id: string };
+        query?: { directory: string };
+      }) => Promise<unknown>;
+    };
+    const probeArgs = {
+      path: { id: sessionId },
+      ...(options.directory ? { query: { directory: options.directory } } : {}),
     };
 
     if (typeof sessionApi.get === 'function') {
-      const info = unwrapData(
-        await safely(() => sessionApi.get?.({ path: { id: sessionId } })),
-      );
+      const info = unwrapData(await safely(() => sessionApi.get?.(probeArgs)));
       const fromSession = readAgentName(info);
       if (fromSession) return fromSession;
       if (info && typeof info === 'object') {
@@ -234,7 +252,7 @@ export async function resolveSessionAgent(
 
     if (typeof sessionApi.messages === 'function') {
       const list = unwrapData(
-        await safely(() => sessionApi.messages?.({ path: { id: sessionId } })),
+        await safely(() => sessionApi.messages?.(probeArgs)),
       );
       if (Array.isArray(list)) {
         for (let index = list.length - 1; index >= 0; index--) {

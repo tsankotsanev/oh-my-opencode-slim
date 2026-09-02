@@ -67,11 +67,7 @@ import {
   createWebfetchTool,
 } from './tools';
 import { pickAgentModelRef } from './tools/smartfetch/secondary-model';
-import {
-  applyActivityEvent,
-  resolveEventSessionID,
-  TaskActivityTracker,
-} from './tools/task-activity';
+import { resolveEventSessionID } from './tools/task-activity';
 import {
   clearTuiAgentActivities,
   recordTuiAgentActivity,
@@ -274,7 +270,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
   let getRevivedContextFiles = (_taskID: string): ContextFile[] => [];
   let pruneRevivedContext = () => {};
   let taskStatusTools: ReturnType<typeof createTaskStatusTool>;
-  const taskActivityTracker = new TaskActivityTracker();
   let waitForUserTools: ReturnType<typeof createWaitForUserTool>;
   let acpRunTools: Record<string, ReturnType<typeof createAcpRunTool>>;
   let webfetch: ReturnType<typeof createWebfetchTool>;
@@ -625,7 +620,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
     taskStatusTools = createTaskStatusTool({
       input: ctx,
       backgroundJobBoard: backgroundJobCoordinator,
-      activityTracker: taskActivityTracker,
     });
     waitForUserTools = createWaitForUserTool({
       shouldManageSession: (sessionID) =>
@@ -1093,7 +1087,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       // Session-scoped events (session.*) carry the session id in info.id;
       // message/step-scoped events (message.updated, step-finish) carry the
       // message id in info.id and the session id in info.sessionID. Resolve
-      // by session so child activity refreshes the correct stuck timer.
+      // by session so per-session bookkeeping lands on the right key.
       const eventSessionID = resolveEventSessionID(event);
       const statusType = event.properties?.status?.type;
       if (
@@ -1108,7 +1102,6 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         toolLoopGuard.resetSession(eventSessionID);
       }
       if (eventSessionID) {
-        applyActivityEvent(taskActivityTracker, event);
         if (
           event.type === 'session.status' &&
           (statusType === 'busy' || statusType === 'retry')

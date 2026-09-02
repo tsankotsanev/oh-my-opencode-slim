@@ -1,5 +1,9 @@
 import type { PluginInput } from '@opencode-ai/plugin';
-import type { BackgroundJobStore, ContextFile } from '../../utils';
+import type {
+  BackgroundJobRecord,
+  BackgroundJobStore,
+  ContextFile,
+} from '../../utils';
 import {
   getRuntimeSessionStatusSnapshot,
   runtimeSessionStatus,
@@ -106,6 +110,16 @@ export function createRuntimeStatusReconciler(options: {
       return;
     }
 
+    // Lanes to judge for silence, collected during the pass and probed only
+    // AFTER it. A silence probe is a bounded network read, and awaiting it
+    // inline would let N hung children delay every remaining lane's
+    // stop-confirmation by up to N x the probe timeout. The board writes in
+    // the loop are synchronous, so ordering is unaffected.
+    const silenceCandidates: Array<{
+      job: BackgroundJobRecord;
+      status: 'busy' | 'retry';
+    }> = [];
+
     for (const job of running) {
       if (disposed) return;
       const current = options.backgroundJobBoard.get(job.taskID);
@@ -124,9 +138,8 @@ export function createRuntimeStatusReconciler(options: {
         );
         // `busy` is upstream's proof of life; it is also the exact signature of
         // a hung stream. Judge the same reading against the lane's activity
-        // clock before moving on.
-        await silenceMonitor.observe(current, status);
-        if (disposed) return;
+        // clock, but not before every lane has been reconciled.
+        silenceCandidates.push({ job: current, status });
         continue;
       }
       if (
@@ -170,6 +183,16 @@ export function createRuntimeStatusReconciler(options: {
         },
       );
     }
+
+    if (disposed || silenceCandidates.length === 0) return;
+    // Concurrent: each observation re-verifies the record after its own await
+    // and each probe carries its own timeout, so one hung lane bounds only
+    // itself.
+    await Promise.all(
+      silenceCandidates.map((candidate) =>
+        silenceMonitor.observe(candidate.job, candidate.status),
+      ),
+    );
   }
 
   async function reconcile(): Promise<void> {

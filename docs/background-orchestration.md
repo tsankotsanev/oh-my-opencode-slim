@@ -510,27 +510,50 @@ Three kinds of lane are silent by design and are never flagged:
   `running` and `completed` updates, so a long `bash` or nested subagent call
   is byte-identical to a freeze. Any unfinished tool part in the last assistant
   message exempts the lane, subject only to an internal 30-minute backstop.
+  This is also what covers a child blocked on a **permission or question
+  prompt** today: such a lane is parked on a pending tool part, so the tool
+  exemption already sees it. (A direct input-wait seam exists in the code but
+  is currently orchestrator-scoped in OpenCode; wiring it for children lands
+  with the lane-control work.)
 - **Retrying a provider call.** `retry` is a healthy, self-resolving state; the
   lane genuinely has nothing to say until the retry lands, and the silence
   clock restarts when it does.
-- **Awaiting a permission or question answer.** The lane is blocked on a human,
-  not hung.
+
+One case is flagged and is *advisory rather than a fault*: a model doing more
+than `staleAfterMs` of **non-streamed reasoning** emits no parts either, so it
+will eventually be reported as `status uncertain`. The `Last seen` excerpt makes
+that easy to recognise (the lane's last text is a coherent partial thought, not
+a truncated stream), and the flag is not terminal — the lane keeps running and
+clears itself the moment it emits. Raise `staleAfterMs` if your models routinely
+think for longer than the budget.
 
 Recovery is never inferred from a `busy` reading, because for a silent lane
 that reading *is* the freeze signature — only real output clears the flag,
-along with its reason and captured excerpt. While the flag stands its reason
-text is frozen at the transition rather than recounting the seconds each cycle,
-and each lane is re-probed at most once per `staleAfterMs`. A flagged lane is
-not terminal and is never reusable; it is a statement that the outcome is
-unknown, which is exactly what a hung stream leaves behind.
+along with its reason and captured excerpt. Messages written *into* a lane do
+not count: prompting a hung child with `task_message` produces user-message
+events, and treating those as progress would let a poke buy the lane another
+full silence window. Only the lane's own output revives it. While the flag
+stands its reason text is frozen at the transition rather than recounting the
+seconds each cycle, and each lane is re-probed at most once per `staleAfterMs`.
+A flagged lane is not terminal and is never reusable; it is a statement that
+the outcome is unknown, which is exactly what a hung stream leaves behind.
+
+`task_status` reads the same record, so its `possibly_stuck` field is exactly
+this flag and its `idle_for_seconds` is exactly this activity clock. The tool
+and the rendered board cannot disagree, and the tool inherits the exemptions
+above instead of applying a second, blunter idle threshold of its own.
 
 A child `session.error` carrying a transport fault (`ECONNRESET`, `ENOTFOUND`,
 `ETIMEDOUT`, `EAI_AGAIN`, `ECONNREFUSED`, or a bare `fetch failed` /
-`socket hang up` / timeout message) is classified the same way. The wire broke;
-the task did not fail. Recording it as terminal `error` would report a failure
-the orchestrator acts on, so it becomes recoverable `status uncertain` instead.
-Persistent auth/model errors (401/410) keep their existing foreground-fallback
-deferral.
+`socket hang up` / timeout message) is recorded as `error` — like any other
+child error — but with a summary that names the cause and refuses to call the
+task failed: *"Child session lost its transport connection (fetch failed); the
+task outcome is unknown."* The state stays `error` deliberately, because an
+`error` record can be revived in place with `task_revive` on the same session,
+whereas leaving the lane `running, status uncertain` would let the child's
+follow-on idle drive it into `stopped` — which is not revivable and would lose
+the transport cause along the way. Persistent auth/model errors (401/410) keep
+their existing foreground-fallback deferral.
 
 Both behaviours are configurable:
 
