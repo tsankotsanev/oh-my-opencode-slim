@@ -18,9 +18,16 @@ import { isRecord as isObjectRecord } from '../../utils/guards';
 import {
   consumeStopIntent,
   createServerSidecar,
+  INTENT_RETENTION_MS,
   laneIntentsPath,
+  readLaneIntents,
 } from '../../utils/lane-control';
-import { createLaneMirror } from '../../utils/lane-mirror';
+import {
+  claimLaneWriters,
+  createLaneMirror,
+  releaseLaneWriters,
+} from '../../utils/lane-mirror';
+import { log } from '../../utils/logger';
 import { createLaneServerUrlResolver } from '../../utils/server-url';
 import type { SessionLifecycle } from '../session-lifecycle';
 import { isMessageWithParts, isUserMessageWithParts } from '../types';
@@ -210,7 +217,7 @@ export function createTaskSessionManagerHook(
     /** `backgroundJobs.staleAfterMs`; silence budget for a busy lane. */
     staleAfterMs?: number;
     /**
-     * `backgroundJobs.laneControl` — the `omo lanes` control channel (board
+     * `backgroundJobs.laneControl` — the `omos lanes` control channel (board
      * mirror + server sidecar + stop intents).
      *
      * Defaults to OFF here even though the user-facing config defaults to on:
@@ -401,7 +408,7 @@ export function createTaskSessionManagerHook(
     options.backgroundJobSupervisor,
   );
 
-  // ── Lane control (`omo lanes`) ─────────────────────────────────────
+  // ── Lane control (`omos lanes`) ────────────────────────────────────
   // Write-only, out-of-band, and never read back: the mirror exists so a
   // SECOND terminal can list/steer lanes at zero token cost, while this
   // process keeps rehydrating from the transcript exactly as before. See
@@ -416,12 +423,62 @@ export function createTaskSessionManagerHook(
     resolveServerUrl: createLaneServerUrlResolver(_ctx),
     ...(options.laneServerInfoFile ? { file: options.laneServerInfoFile } : {}),
   });
+
+  /**
+   * Label lanes the user stopped from the CLI when no abort event could carry
+   * the attribution.
+   *
+   * `omos lanes stop` on a lane that is ALREADY terminal (an ESC cascade or a
+   * silent failure got there first) records the cancellation but has nothing
+   * to abort, so `session.error` never arrives and the event-router claim in
+   * `claimUserStopIntent` never fires. Without this sweep the CLI's "recorded
+   * as your cancellation" would be a promise nothing keeps.
+   *
+   * Runs from the mirror's own flush, so it costs one read of a normally
+   * absent file per second at most — never one per event. Only terminal,
+   * unlabelled, non-orchestrator-cancelled records are eligible: an intent for
+   * a still-`running` lane belongs to the abort that is about to arrive, and
+   * claiming it here would steal the attribution from the real event.
+   */
+  const claimSettledUserStops = (): void => {
+    if (!laneIntentsFile) return;
+    // One read (a missing file costs one failed open), and only then a claim.
+    const pending = readLaneIntents(laneIntentsFile);
+    for (const intent of pending) {
+      const job = backgroundJobBoard.get(intent.sessionID);
+      if (!job) continue;
+      if (job.state !== 'error' && job.state !== 'stopped') continue;
+      if (job.cancelledByUser !== undefined) continue;
+      if (job.cancellationRequested) continue;
+      // Claimed against the full retention window rather than the 60s abort
+      // window: this intent has no event to correlate with, it is a standalone
+      // statement that the user ended this lane.
+      const claimed = consumeStopIntent(laneIntentsFile, intent.sessionID, {
+        withinMs: INTENT_RETENTION_MS,
+      });
+      if (!claimed) continue;
+      const labelled = backgroundJobBoard.markCancelledByUser(
+        intent.sessionID,
+        claimed.reason,
+      );
+      log('[task-session-manager] settled lane labelled as user-stopped', {
+        sessionID: intent.sessionID,
+        alias: labelled?.alias,
+        state: labelled?.state,
+        reason: claimed.reason,
+      });
+    }
+  };
+
   const laneMirror = createLaneMirror({
     directory: _ctx.directory,
     enabled: laneControlEnabled,
     lanes: () => backgroundJobBoard.list(),
-    // The mirror only writes when the board changed, which is also the
-    // cheapest moment to prove the server is still alive.
+    // Bookkeeping that must be visible in the file about to be written.
+    onBeforeFlush: claimSettledUserStops,
+    // A flush means "the plugin looked", not "a lane changed" (the write
+    // itself is skipped when the content is identical). It is still the
+    // cheapest cadence available for proving the server is alive.
     onFlush: () => laneServerSidecar.refresh(),
     ...(options.laneMirrorFile ? { file: options.laneMirrorFile } : {}),
   });
@@ -429,6 +486,20 @@ export function createTaskSessionManagerHook(
     ? (sessionID: string): { reason?: string } | undefined =>
         consumeStopIntent(laneIntentsFile, sessionID)
     : undefined;
+
+  /**
+   * Tear down this generation's writers, and let a newer generation take over.
+   *
+   * Registered module-side so the plugin factory re-running (every config
+   * update) cannot leave two mirrors and two sidecar heartbeats fighting over
+   * one directory.
+   */
+  const disposeLaneWriters = (): void => {
+    laneMirror.dispose();
+    laneServerSidecar.dispose();
+    releaseLaneWriters(_ctx.directory, disposeLaneWriters);
+  };
+  if (laneControlEnabled) claimLaneWriters(_ctx.directory, disposeLaneWriters);
 
   return {
     markRevivedRunPending: (taskID: string): void => {
@@ -638,8 +709,7 @@ export function createTaskSessionManagerHook(
         // Flush last, then drop the sidecar: a missing sidecar makes the CLI
         // say "start OpenCode or pass --server", whereas a stale one would
         // send it at a dead (or recycled) port.
-        laneMirror.dispose();
-        laneServerSidecar.dispose();
+        disposeLaneWriters();
       }
       return handleEvent(input, {
         inputWaits,

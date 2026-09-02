@@ -128,12 +128,12 @@ export interface BackgroundJobRecord {
    *
    * A lane blocked on a human answering a permission request is silent by
    * design, so this both exempts it from silence detection and gives the
-   * parent (and `omo lanes list`) the one fact that explains the pause. The
+   * parent (and `omos lanes list`) the one fact that explains the pause. The
    * timestamp is bookkeeping only and is deliberately never rendered.
    */
   awaitingPermission?: AwaitingPermission;
   /**
-   * The user stopped this lane from a second terminal (`omo lanes stop`).
+   * The user stopped this lane from a second terminal (`omos lanes stop`).
    *
    * A LABEL, never a state: the terminal state itself is still whatever the
    * lifecycle recorded (an aborted child lands as `error`), so a lost or
@@ -753,7 +753,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   }
 
   /**
-   * Attribute an already-recorded outcome to a user `omo lanes stop`.
+   * Attribute an already-recorded outcome to a user `omos lanes stop`.
    *
    * Label only — the state, summary and reconciliation flags are untouched, so
    * an aborted child stays the `error` record its lifecycle produced and
@@ -1635,7 +1635,7 @@ function formatAwaitingPermission(
 }
 
 /**
- * Attribute a terminal record to the user's own `omo lanes stop`.
+ * Attribute a terminal record to the user's own `omos lanes stop`.
  *
  * The label is advisory (an intent line can be lost or, in theory, reused), so
  * the text never contradicts the state — it explains who ended the run and
@@ -1647,7 +1647,7 @@ function formatUserStop(job: BackgroundJobRecord): string[] | undefined {
   if (!stop) return undefined;
   const reason = stop.reason ? `: ${promptSafe(stop.reason)}` : '';
   return [
-    `  Stopped by: the user, from a second terminal (omo lanes stop)${reason}`,
+    `  Stopped by: the user, from a second terminal (omos lanes stop)${reason}`,
     '  Action: treat this as a user cancellation - do not relaunch it unasked; its session is intact, so task_revive(task_id) resumes it if the user asks.',
   ];
 }

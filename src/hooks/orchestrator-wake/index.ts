@@ -14,13 +14,13 @@ import {
   createInternalAgentTextPart,
   isInternalInitiatorPart,
 } from '../../utils';
-import { isRecord as isObjectRecord } from '../../utils/guards';
-import { log } from '../../utils/logger';
-import type { SessionLifecycle } from '../session-lifecycle';
 import {
   type ContinuationModelSelection,
   parseContinuationModelSelection,
-} from '../task-session-manager/continuation-model-selection';
+} from '../../utils/continuation-model-selection';
+import { isRecord as isObjectRecord } from '../../utils/guards';
+import { log } from '../../utils/logger';
+import type { SessionLifecycle } from '../session-lifecycle';
 import { isActiveStatus } from '../task-session-manager/status-utils';
 import {
   clearExpectingWakeBusy,

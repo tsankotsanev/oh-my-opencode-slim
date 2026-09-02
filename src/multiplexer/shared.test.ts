@@ -104,7 +104,7 @@ describe('gracefulClosePane', () => {
 });
 
 describe('decoratePaneTitle', () => {
-  test('prefixes the lane alias so panes match the board and omo lanes', async () => {
+  test('prefixes the lane alias so panes match the board and omos lanes', async () => {
     const { decoratePaneTitle } = await importShared();
     expect(decoratePaneTitle('Fix the parser', 'fix-1')).toBe(
       'fix-1 · Fix the parser',

@@ -12,12 +12,14 @@ import path from 'node:path';
 import { BackgroundJobBoard } from './background-job-board';
 import {
   canonicalDirectory,
+  claimLaneWriters,
   createLaneMirror,
   LANE_MIRROR_VERSION,
   laneMirrorPath,
   laneStateDir,
   laneStateKey,
   readLaneMirror,
+  releaseLaneWriters,
   toLaneMirrorRecord,
   writeLaneMirror,
 } from './lane-mirror';
@@ -116,14 +118,17 @@ describe('toLaneMirrorRecord', () => {
       agent: 'fixer',
       state: 'running',
       statusUncertain: false,
+      cancellationRequested: false,
       terminalUnreconciled: false,
-      awaitingPermission: { tool: 'bash', at: 2_000, permissionID: 'per_1' },
     });
-    // Nothing about leases, generations or context files leaks into the copy.
+    // Nothing about leases, generations or context files leaks into the copy,
+    // and the permission request id is stripped (it only fences the plugin's
+    // own clear).
     expect(Object.keys(mirrored).sort()).toEqual([
       'agent',
       'alias',
       'awaitingPermission',
+      'cancellationRequested',
       'label',
       'launchedAt',
       'objective',
@@ -134,6 +139,7 @@ describe('toLaneMirrorRecord', () => {
       'terminalUnreconciled',
       'updatedAt',
     ]);
+    expect(mirrored.awaitingPermission).toEqual({ tool: 'bash', at: 2_000 });
   });
 
   test('carries the user-stop label and the terminal summary', () => {
@@ -153,6 +159,46 @@ describe('toLaneMirrorRecord', () => {
       at: 5_000,
       reason: 'wrong file set',
     });
+  });
+});
+
+describe('toLaneMirrorRecord field hygiene', () => {
+  test('truncates unbounded free text and normalizes whitespace', () => {
+    const { board, record } = seedRunningLane();
+    board.registerLaunch({
+      taskID: record.taskID,
+      parentSessionID: 'ses_parent',
+      agent: 'fixer',
+      description: 'fix   the\n parser',
+      objective: 'o'.repeat(900),
+      now: 2_000,
+    });
+    board.updateStatus({
+      taskID: record.taskID,
+      state: 'error',
+      resultSummary: 'e'.repeat(900),
+    });
+
+    const mirrored = toLaneMirrorRecord(
+      board.get(record.taskID) as NonNullable<ReturnType<typeof board.get>>,
+    );
+    expect(mirrored.label).toBe('fix the parser');
+    expect(mirrored.objective).toHaveLength(300);
+    expect(mirrored.objective?.endsWith('\u2026')).toBe(true);
+    expect(mirrored.resultSummary).toHaveLength(300);
+  });
+
+  test('publishes cancellationRequested (a CLI refusal input)', () => {
+    const { board, record } = seedRunningLane();
+    board.claimWallClockDeadline({
+      taskID: record.taskID,
+      generation: record.generation,
+    });
+    expect(
+      toLaneMirrorRecord(
+        board.get(record.taskID) as NonNullable<ReturnType<typeof board.get>>,
+      ).cancellationRequested,
+    ).toBe(true);
   });
 });
 
@@ -337,6 +383,64 @@ describe('createLaneMirror', () => {
     expect(readLaneMirror(mirror.file)?.lanes).toHaveLength(1);
   });
 
+  test('skips the write when nothing about the lanes changed (S4)', () => {
+    const h = harness();
+    h.mirror.flushNow();
+    const first = readLaneMirror(h.mirror.file);
+    expect(first?.savedAt).toBe(10_000);
+
+    // A flush with no board change must not rewrite the file, and must not
+    // move `savedAt` — a reader would take that as "the board just moved".
+    h.advance(5_000);
+    h.mirror.flushNow();
+    expect(readLaneMirror(h.mirror.file)?.savedAt).toBe(10_000);
+
+    // A real change lands, stamped with the moment it changed.
+    h.board.updateStatus({ taskID: 'ses_child1', state: 'completed' });
+    h.mirror.flushNow();
+    const second = readLaneMirror(h.mirror.file);
+    expect(second?.savedAt).toBe(15_000);
+    expect(second?.lanes[0]?.state).toBe('completed');
+  });
+
+  test('onBeforeFlush runs before the board is read, once per flush', () => {
+    const { board } = seedRunningLane();
+    const calls: string[] = [];
+    const mirror = createLaneMirror({
+      directory: projectDir,
+      enabled: true,
+      lanes: () => {
+        calls.push('lanes');
+        return board.list();
+      },
+      onBeforeFlush: () => {
+        calls.push('before');
+        board.updateStatus({ taskID: 'ses_child1', state: 'error' });
+      },
+      onFlush: () => calls.push('after'),
+    });
+    mirror.flushNow();
+    expect(calls).toEqual(['before', 'lanes', 'after']);
+    // The bookkeeping it did is visible in the file this flush wrote.
+    expect(readLaneMirror(mirror.file)?.lanes[0]?.state).toBe('error');
+  });
+
+  test('a throwing onBeforeFlush never breaks the write', () => {
+    const { board } = seedRunningLane();
+    const mirror = createLaneMirror({
+      directory: projectDir,
+      enabled: true,
+      lanes: () => board.list(),
+      onBeforeFlush: () => {
+        throw new Error('sweep exploded');
+      },
+    });
+    expect(() => {
+      mirror.flushNow();
+    }).not.toThrow();
+    expect(readLaneMirror(mirror.file)?.lanes).toHaveLength(1);
+  });
+
   test('exposes no way to read the mirror back into a board', () => {
     const h = harness();
     // Guard against a future "just add load()" regression: the plugin must
@@ -347,5 +451,53 @@ describe('createLaneMirror', () => {
       'flushNow',
       'scheduleFlush',
     ]);
+  });
+});
+
+describe('claimLaneWriters', () => {
+  test('a new plugin generation disposes the previous writers', () => {
+    const disposed: string[] = [];
+    const first = () => disposed.push('first');
+    const second = () => disposed.push('second');
+
+    claimLaneWriters(projectDir, first);
+    expect(disposed).toEqual([]);
+
+    // The factory re-runs (config update): the old mirror timer and sidecar
+    // heartbeat must not keep running against a board nobody reads.
+    claimLaneWriters(projectDir, second);
+    expect(disposed).toEqual(['first']);
+
+    releaseLaneWriters(projectDir, second);
+    claimLaneWriters(projectDir, first);
+    expect(disposed).toEqual(['first']);
+    releaseLaneWriters(projectDir, first);
+  });
+
+  test('two spellings of one directory are the same owner', () => {
+    const disposed: string[] = [];
+    const first = () => disposed.push('first');
+    claimLaneWriters(projectDir, first);
+    claimLaneWriters(`${projectDir}/.`, () => {});
+    expect(disposed).toEqual(['first']);
+  });
+
+  test('a throwing predecessor does not stop the new generation', () => {
+    claimLaneWriters(projectDir, () => {
+      throw new Error('teardown exploded');
+    });
+    expect(() => {
+      claimLaneWriters(projectDir, () => {});
+    }).not.toThrow();
+  });
+
+  test('release only forgets the current owner', () => {
+    const disposed: string[] = [];
+    const owner = () => disposed.push('owner');
+    claimLaneWriters(projectDir, owner);
+    // A stale dispose from an older generation must not clear the registry.
+    releaseLaneWriters(projectDir, () => {});
+    claimLaneWriters(projectDir, () => {});
+    expect(disposed).toEqual(['owner']);
   });
 });

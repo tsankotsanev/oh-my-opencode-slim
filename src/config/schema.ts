@@ -287,7 +287,7 @@ export const BackgroundJobsConfigSchema = z.object({
     .boolean()
     .default(true)
     .describe(
-      'When true, the plugin publishes a small JSON mirror of the Background Job Board plus a server sidecar under the plugin data directory, so `omo lanes list/show/stop/say` can inspect and steer background lanes from a second terminal without spending an orchestrator turn. The mirror is written only (never read back: live lanes are rehydrated from the transcript) and the CLI writes only stop intents. Default enabled.',
+      'When true, the plugin publishes a small JSON mirror of the Background Job Board plus a server sidecar under the plugin data directory, so `omos lanes list/show/stop/say` can inspect and steer background lanes from a second terminal without spending an orchestrator turn. The mirror is written only (never read back: live lanes are rehydrated from the transcript) and the CLI writes only stop intents. Default enabled.',
     ),
   concurrency: BackgroundTaskConcurrencyConfigSchema,
   waitForUserGuard: z

@@ -207,7 +207,7 @@ export interface BackgroundJobStore {
     options?: { permissionID?: string },
   ): BackgroundJobRecord | undefined;
   /**
-   * Label an already-recorded outcome as the user's own `omo lanes stop`.
+   * Label an already-recorded outcome as the user's own `omos lanes stop`.
    * State/summary are untouched; refused when the orchestrator's cancellation
    * path owns the run.
    */

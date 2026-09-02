@@ -269,10 +269,11 @@ interface LaneTracking {
  * Is this lane waiting on a human rather than frozen?
  *
  * Two sources, both needed. `hasInputWait` is upstream's input-wait tracker,
- * which by design only follows ORCHESTRATOR sessions (`shouldManageSession`),
- * so for a background child it always answers false. The board stamp
- * (`awaitingPermission`) is the child-side half, written by the event router
- * from this lane's own `permission.updated`.
+ * which reads the same permission/question events correctly but is scoped to
+ * ORCHESTRATOR sessions (`shouldManageSession`), so for a background child it
+ * always answers false. The board stamp (`awaitingPermission`) is the
+ * child-side half, written by the event router from this lane's own
+ * `permission.asked`.
  */
 function awaitsHuman(
   options: SilenceMonitorOptions,

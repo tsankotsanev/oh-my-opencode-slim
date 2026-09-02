@@ -1,5 +1,5 @@
 /**
- * Plugin side of `omo lanes`: the permission (HITL) stamp for child lanes, the
+ * Plugin side of `omos lanes`: the permission (HITL) stamp for child lanes, the
  * user-stop attribution on an abort, and the mirror/sidecar/intent wiring in
  * the task-session-manager hook.
  */
@@ -102,6 +102,60 @@ function runningBoard(): BackgroundJobBoard {
 }
 
 describe('permission stamp for child lanes', () => {
+  test('the in-process CORE ask shape stamps the tool (permission.asked)', async () => {
+    // This is what a plugin actually receives: core's own event bus payload,
+    // where the tool is `permission`, not `type`. Getting this wrong makes the
+    // whole stamp dead code.
+    const board = runningBoard();
+    await route(createDeps(board), 'permission.asked', {
+      id: 'per_1',
+      sessionID: 'child-1',
+      permission: 'bash',
+      patterns: ['rm *'],
+      metadata: {},
+      always: [],
+      tool: { messageID: 'msg_1', callID: 'call_1' },
+    });
+
+    expect(board.get('child-1')?.awaitingPermission).toEqual({
+      tool: 'bash',
+      at: 10_000,
+      permissionID: 'per_1',
+    });
+  });
+
+  test('the CORE reply shape clears it (requestID, not permissionID)', async () => {
+    const board = runningBoard();
+    const deps = createDeps(board);
+    await route(deps, 'permission.asked', {
+      id: 'per_1',
+      sessionID: 'child-1',
+      permission: 'bash',
+    });
+    await route(deps, 'permission.replied', {
+      sessionID: 'child-1',
+      requestID: 'per_1',
+      reply: 'once',
+    });
+    expect(board.get('child-1')?.awaitingPermission).toBeUndefined();
+  });
+
+  test('a CORE reply to a superseded prompt leaves the stamp alone', async () => {
+    const board = runningBoard();
+    const deps = createDeps(board);
+    await route(deps, 'permission.asked', {
+      id: 'per_2',
+      sessionID: 'child-1',
+      permission: 'edit',
+    });
+    await route(deps, 'permission.replied', {
+      sessionID: 'child-1',
+      requestID: 'per_1',
+      reply: 'reject',
+    });
+    expect(board.get('child-1')?.awaitingPermission?.tool).toBe('edit');
+  });
+
   test('permission.updated stamps the tool the lane is blocked on', async () => {
     const board = runningBoard();
     await route(createDeps(board), 'permission.updated', {
@@ -129,17 +183,37 @@ describe('permission stamp for child lanes', () => {
     expect(board.get('child-1')?.awaitingPermission?.tool).toBe('edit');
   });
 
-  test('a non-identifier type falls back to the title', async () => {
+  test('the title names the tool when neither permission nor type does', async () => {
     const board = runningBoard();
     await route(createDeps(board), 'permission.updated', {
       id: 'per_1',
-      type: 'tool call with spaces',
       title: 'Allow the network fetch?',
       sessionID: 'child-1',
     });
     expect(board.get('child-1')?.awaitingPermission?.tool).toBe(
       'Allow the network fetch?',
     );
+  });
+
+  test('an identifier-shaped candidate wins over a sentence', async () => {
+    const board = runningBoard();
+    await route(createDeps(board), 'permission.asked', {
+      id: 'per_1',
+      sessionID: 'child-1',
+      permission: 'webfetch',
+      title: 'Allow the network fetch?',
+    });
+    expect(board.get('child-1')?.awaitingPermission?.tool).toBe('webfetch');
+  });
+
+  test('a long sentence is truncated before it reaches the board', async () => {
+    const board = runningBoard();
+    await route(createDeps(board), 'permission.updated', {
+      id: 'per_1',
+      sessionID: 'child-1',
+      title: 'x'.repeat(400),
+    });
+    expect(board.get('child-1')?.awaitingPermission?.tool).toHaveLength(60);
   });
 
   test('permission.replied clears it', async () => {
@@ -384,6 +458,96 @@ describe('task-session-manager lane-control wiring', () => {
     });
     // Consumed: a later abort of the same lane must not reuse the line.
     expect(readLaneIntents(intentsFile)).toEqual([]);
+  });
+
+  test('a stop intent for an ALREADY terminal lane is claimed on flush (S2)', async () => {
+    // No abort follows a lane that was already dead, so the event-router claim
+    // never fires; the mirror flush is what keeps the CLI's promise.
+    const board = runningBoard();
+    board.updateStatus({ taskID: 'child-1', state: 'error' });
+    const hook = createHook(true, board);
+    const intentsFile = laneIntentsPath(projectDir);
+    appendLaneIntent(intentsFile, {
+      at: Date.now(),
+      action: 'stop',
+      sessionID: 'child-1',
+      reason: 'stay dead',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'other', status: { type: 'busy' } },
+      },
+    } as never);
+
+    expect(board.get('child-1')?.cancelledByUser).toMatchObject({
+      reason: 'stay dead',
+    });
+    expect(readLaneIntents(intentsFile)).toEqual([]);
+    // The label is visible in the very file this flush wrote.
+    expect(
+      readLaneMirror(laneMirrorPath(projectDir))?.lanes[0]?.cancelledByUser,
+    ).toMatchObject({ reason: 'stay dead' });
+  });
+
+  test('the sweep leaves a RUNNING lane intent for the abort event', async () => {
+    const board = runningBoard();
+    const hook = createHook(true, board);
+    const intentsFile = laneIntentsPath(projectDir);
+    appendLaneIntent(intentsFile, {
+      at: Date.now(),
+      action: 'stop',
+      sessionID: 'child-1',
+      reason: 'kill it',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'child-1', status: { type: 'busy' } },
+      },
+    } as never);
+    expect(board.get('child-1')?.cancelledByUser).toBeUndefined();
+    expect(readLaneIntents(intentsFile)).toHaveLength(1);
+
+    // ...and the abort that follows claims it, exactly once.
+    await hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'child-1', error: ABORT_ERROR },
+      },
+    } as never);
+    expect(board.get('child-1')?.cancelledByUser).toMatchObject({
+      reason: 'kill it',
+    });
+    expect(readLaneIntents(intentsFile)).toEqual([]);
+  });
+
+  test('the sweep never relabels an orchestrator-owned cancellation', async () => {
+    const board = runningBoard();
+    const lease = board.acquireCancellationLease('child-1', 1);
+    board.markCancelled('child-1', 'obsolete', Date.now(), {
+      force: true,
+      expectedGeneration: 1,
+      cancellationLease: lease,
+    });
+    board.releaseLease(lease as NonNullable<typeof lease>);
+    const hook = createHook(true, board);
+    appendLaneIntent(laneIntentsPath(projectDir), {
+      at: Date.now(),
+      action: 'stop',
+      sessionID: 'child-1',
+      reason: 'mine',
+    });
+
+    await hook.event({
+      event: {
+        type: 'session.status',
+        properties: { sessionID: 'other', status: { type: 'busy' } },
+      },
+    } as never);
+    expect(board.get('child-1')?.cancelledByUser).toBeUndefined();
   });
 
   test('server.instance.disposed flushes, then removes the sidecar', async () => {

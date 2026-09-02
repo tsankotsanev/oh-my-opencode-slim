@@ -641,7 +641,7 @@ describe('silence detection: activity heartbeat wiring', () => {
     const at = LAUNCH_AT + 400_000;
     const deps = eventDeps(board, () => at);
 
-    // task_message / `omo lanes say` prompting a hung child: the host emits a
+    // task_message / `omos lanes say` prompting a hung child: the host emits a
     // user message plus its part events. None of it is output BY the lane.
     await handleEvent(
       {

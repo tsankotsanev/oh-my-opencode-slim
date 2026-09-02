@@ -1,5 +1,5 @@
 /**
- * Read-only view of the lane mirror for the `omo lanes` CLI.
+ * Read-only view of the lane mirror for the `omos lanes` CLI.
  *
  * The CLI is a SECOND process: the in-memory Background Job Board inside the
  * OpenCode server is the source of truth and this file is a convenience copy

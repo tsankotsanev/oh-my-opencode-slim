@@ -3,11 +3,11 @@ import {
   type ToolDefinition,
   tool,
 } from '@opencode-ai/plugin';
+import type { BackgroundJobStore } from '../utils/background-job-store';
 import {
   type ContinuationModelSelection,
   parseContinuationModelSelection,
-} from '../hooks/task-session-manager/continuation-model-selection';
-import type { BackgroundJobStore } from '../utils/background-job-store';
+} from '../utils/continuation-model-selection';
 import { getClient } from '../utils/opencode-client';
 import { OperationTimeoutError, withTimeout } from '../utils/session';
 

@@ -76,7 +76,7 @@ oh-my-opencode-slim installer
 Usage:
   bunx oh-my-opencode-slim install [OPTIONS]
   bunx oh-my-opencode-slim doctor [OPTIONS]
-  omo lanes [list|show|stop|say] [OPTIONS]
+  omos lanes [list|show|stop|say] [OPTIONS]
 
 Options:
   --skills=yes|no|force  Install bundled skills; force replaces existing skill
@@ -98,12 +98,12 @@ Doctor options:
   --json                 Print diagnostics as JSON
 
 Lane control (second terminal, zero orchestrator turns):
-  omo lanes              List this project's background subagent lanes
-  omo lanes show <alias> Print the tail of a lane's transcript
-  omo lanes stop <alias> Abort one lane (its session survives)
-  omo lanes say <alias> "…"
+  omos lanes              List this project's background subagent lanes
+  omos lanes show <alias> Print the tail of a lane's transcript
+  omos lanes stop <alias> Abort one lane (its session survives)
+  omos lanes say <alias> "…"
                          Queue an instruction for a running lane
-  omo lanes --help       Full lane options
+  omos lanes --help       Full lane options
 
 Available presets: ${getGeneratedPresetNames().join(', ')}
 

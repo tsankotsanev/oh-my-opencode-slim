@@ -1,6 +1,6 @@
 /**
  * Out-of-band control channel between a running OpenCode server and the
- * `omo lanes` CLI in a second terminal.
+ * `omos lanes` CLI in a second terminal.
  *
  * The problem it solves: the user runs ONE long-lived orchestrator session,
  * and every question about its background lanes ("what is running?", "stop

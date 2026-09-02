@@ -1,5 +1,5 @@
 /**
- * Argument parsing for the `omo lanes` command group.
+ * Argument parsing for the `omos lanes` command group.
  *
  * Pure and total: every input maps to a value, including malformed input,
  * which becomes `{ command: 'error' }`. The commands themselves therefore
@@ -45,7 +45,7 @@ const KNOWN_SUBCOMMANDS = new Set(['list', 'show', 'stop', 'say']);
 /**
  * Subcommands that are planned but not implemented yet.
  *
- * Named explicitly so `omo lanes revive fix-1` gets a straight answer instead
+ * Named explicitly so `omos lanes revive fix-1` gets a straight answer instead
  * of being reinterpreted as `list` with a stray positional.
  */
 const RESERVED_SUBCOMMANDS = new Map<string, string>([
@@ -105,7 +105,7 @@ function parseFlags(args: string[]): Flags {
     const arg = args[index] as string;
 
     if (arg === '--') {
-      // Everything after `--` is literal: lets `omo lanes say fix-1 -- --json`
+      // Everything after `--` is literal: lets `omos lanes say fix-1 -- --json`
       // send text that starts with a dash.
       flags.positionals.push(...args.slice(index + 1));
       break;
@@ -203,7 +203,7 @@ export function parseLanesArgs(args: string[]): LanesArgs {
     if (flags.positionals.length > 0) {
       return {
         command: 'error',
-        message: `Unexpected argument for "lanes list": ${flags.positionals[0]}. Did you mean "omo lanes show ${flags.positionals[0]}"?`,
+        message: `Unexpected argument for "lanes list": ${flags.positionals[0]}. Did you mean "omos lanes show ${flags.positionals[0]}"?`,
       };
     }
     return { command: 'list', ...common };
@@ -213,7 +213,7 @@ export function parseLanesArgs(args: string[]): LanesArgs {
   if (!selector) {
     return {
       command: 'error',
-      message: `"lanes ${subcommand}" needs a lane alias or session id (see "omo lanes list")`,
+      message: `"lanes ${subcommand}" needs a lane alias or session id (see "omos lanes list")`,
     };
   }
 
@@ -254,13 +254,13 @@ export function parseLanesArgs(args: string[]): LanesArgs {
   if (!text) {
     return {
       command: 'error',
-      message: '"lanes say" needs a message: omo lanes say <alias> "<text>"',
+      message: '"lanes say" needs a message: omos lanes say <alias> "<text>"',
     };
   }
   return { command: 'say', text, ...targeted };
 }
 
-export const LANES_HELP = `Usage: omo lanes <command> [OPTIONS]
+export const LANES_HELP = `Usage: omos lanes <command> [OPTIONS]
 
 Inspect and steer the background subagent lanes of a running OpenCode server
 from a second terminal, without spending an orchestrator turn.
@@ -282,11 +282,11 @@ Options:
   -h, --help                 Show this message
 
 Examples:
-  omo lanes
-  omo lanes list --json
-  omo lanes show fix-1 -n 5
-  omo lanes stop ora-2 --reason "wrong file set"
-  omo lanes say fix-1 "also update the codemap"
+  omos lanes
+  omos lanes list --json
+  omos lanes show fix-1 -n 5
+  omos lanes stop ora-2 --reason "wrong file set"
+  omos lanes say fix-1 "also update the codemap"
 
 Notes:
   - "list" reads a local mirror the plugin writes. It is a convenience copy,

@@ -8,7 +8,7 @@ Local context (do not paste): evidence comes from
 `@opencode-ai/sdk` 1.4.3) and the reproduction script
 `scripts/probes/subagent-probes.ts`. The plugin-side workaround is
 `src/hooks/task-session-manager/cascade-revive.ts` plus
-`omo lanes revive` in `src/cli/lanes/`.
+`omos lanes revive` in `src/cli/lanes/`.
 
 ---
 

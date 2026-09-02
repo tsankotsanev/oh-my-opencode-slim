@@ -190,14 +190,17 @@ bunx oh-my-opencode-slim doctor [OPTIONS]
 
 ### `lanes` Command Group
 Inspect and steer background subagent lanes of a running server, at zero token
-cost. Also exposed through the shorter `omo` bin alias.
+cost. Exposed through the `omos` bin alias (short for oh-my-opencode-slim);
+`omo` is deliberately NOT used — `oh-my-opencode` and an unrelated npm
+package `omo` both publish that name, and a colliding bin would be resolved
+by install order.
 
 **Usage:**
 ```bash
-omo lanes [list]                     # lanes recorded for this project (no server needed)
-omo lanes show <alias|ses_id> [-n N] # tail of a lane's transcript
-omo lanes stop <alias|ses_id> [--reason "…"]
-omo lanes say  <alias|ses_id> "<text>"
+omos lanes [list]                     # lanes recorded for this project (no server needed)
+omos lanes show <alias|ses_id> [-n N] # tail of a lane's transcript
+omos lanes stop <alias|ses_id> [--reason "…"]
+omos lanes say  <alias|ses_id> "<text>"
 ```
 
 **Options:** `--dir <path>`, `--server <url>`, `-n/--count <n>`, `--reason "<text>"`, `--force`, `--json`, `-h/--help`

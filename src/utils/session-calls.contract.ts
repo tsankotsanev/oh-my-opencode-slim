@@ -49,7 +49,7 @@ const client = {
 // abort (foreground-fallback, cancel-task, index.ts)
 client.session.abort({ path: { id: 'ses_x' } });
 
-// abort with directory query (omo lanes stop). The `omo lanes` commands talk
+// abort with directory query (omos lanes stop). The `omos lanes` commands talk
 // to the SDK through their own minimal `LaneClient` interface
 // (src/cli/lanes/server.ts) so the CLI bundle does not depend on the SDK
 // types; pinning the shapes they send here is what keeps that interface from

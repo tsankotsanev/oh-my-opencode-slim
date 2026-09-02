@@ -18,7 +18,7 @@ export function quoteShellArg(value: string): string {
  * Prefix a pane title with the lane alias the Background Job Board assigned.
  *
  * The alias (`fix-1`) is the handle every other surface uses — the board the
- * orchestrator reads, `omo lanes list`, `task_message`, `task_cancel` — so a
+ * orchestrator reads, `omos lanes list`, `task_message`, `task_cancel` — so a
  * pane whose title only shows the session's own subject leaves the user
  * mapping panes to lanes by hand. Idempotent, and a no-op when the alias is
  * unknown (a pane can be spawned before the board has registered the launch).

@@ -1,5 +1,5 @@
 /**
- * How `omo lanes` finds the OpenCode server to talk to.
+ * How `omos lanes` finds the OpenCode server to talk to.
  *
  * The CLI runs in a different terminal than the server, so it cannot ask the
  * plugin anything. Discovery order, most-explicit first:
@@ -11,7 +11,7 @@
  *      derive its own URL in-process.
  *
  * Every failure produces a sentence that tells the user what to do next.
- * `omo lanes` is reached for at the worst possible moment (a lane is
+ * `omos lanes` is reached for at the worst possible moment (a lane is
  * misbehaving), so a stack trace here is a bug.
  */
 
@@ -154,7 +154,7 @@ export function discoverServer(
         '',
         'Fixes:',
         '  - restart OpenCode in that directory, then retry;',
-        '  - or pass the current URL:  omo lanes <command> --server http://127.0.0.1:<port>',
+        '  - or pass the current URL:  omos lanes <command> --server http://127.0.0.1:<port>',
       ].join('\n'),
     };
   }
@@ -168,7 +168,7 @@ export function discoverServer(
       'Fixes, in order of convenience:',
       '  - start (or restart) OpenCode in that directory so the plugin can',
       '    write the sidecar, then retry;',
-      '  - pass the URL directly:  omo lanes <command> --server http://127.0.0.1:<port>',
+      '  - pass the URL directly:  omos lanes <command> --server http://127.0.0.1:<port>',
       '  - or export OMO_OPENCODE_SERVER_URL in both shells.',
       '',
       'The port is printed by `opencode serve`; for the TUI it is also visible',
@@ -214,7 +214,7 @@ export interface LaneClient {
 /**
  * Build a real SDK client.
  *
- * Imported dynamically so the common `omo lanes list` path (which needs no
+ * Imported dynamically so the common `omos lanes list` path (which needs no
  * server at all) never pays for loading the SDK, and so tests can inject a
  * mock client without the SDK being present.
  */

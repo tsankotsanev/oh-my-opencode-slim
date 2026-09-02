@@ -32,6 +32,15 @@ let originalServerEnv: string | undefined;
 const SERVER_URL = 'http://127.0.0.1:4096/';
 const NOW = 1_700_000_000_000;
 
+/**
+ * The lane's CURRENT model, in the shape `Session.model` uses at runtime
+ * (`{ providerID, id }`). Deliberately not the agent's configured model: every
+ * `say` assertion below proves the body carries THIS one, which is what keeps
+ * a foreground-fallback failover from being undone (MODEL rule).
+ */
+const LIVE_MODEL = { providerID: 'anthropic', id: 'claude-fallback-1' };
+const PINNED_MODEL = { providerID: 'anthropic', modelID: 'claude-fallback-1' };
+
 beforeEach(() => {
   originalDataHome = process.env.XDG_DATA_HOME;
   originalServerEnv = process.env[SERVER_URL_ENV];
@@ -61,6 +70,15 @@ interface LaneSeed {
   objective?: string;
   statusUncertain?: boolean;
   cancelledByUser?: string | true;
+  /**
+   * Mark the run as "a cancellation is in flight".
+   *
+   * On master only two paths set this: `markCancelled` under a cancellation
+   * lease (which also settles the state) and the wall-clock supervisor's
+   * `claimWallClockDeadline` (which leaves the lane RUNNING while its abort is
+   * in flight). Both are seeded through their real board methods below.
+   */
+  cancellationRequested?: boolean;
   permissionTool?: string;
 }
 
@@ -90,6 +108,21 @@ function seedLanes(lanes: LaneSeed[] = [{}], directory = projectDir): void {
         now: NOW - 30_000,
       });
     }
+    if (lane.cancellationRequested) {
+      const lease = board.acquireCancellationLease(taskID, 1);
+      if (lane.state === 'cancelled') {
+        board.markCancelled(taskID, 'obsolete', NOW - 2_000, {
+          force: true,
+          expectedGeneration: 1,
+          cancellationLease: lease,
+        });
+      } else {
+        // Running + cancellationRequested: the wall-clock supervisor has
+        // requested an abort and it is still in flight.
+        board.claimWallClockDeadline({ taskID, generation: 1 });
+      }
+      if (lease) board.releaseLease(lease);
+    }
     switch (lane.state) {
       case undefined:
       case 'running':
@@ -99,6 +132,15 @@ function seedLanes(lanes: LaneSeed[] = [{}], directory = projectDir): void {
         break;
       case 'stopped':
         board.markStopped(taskID, 'stopped before a terminal task result');
+        break;
+      case 'cancelled':
+        if (!lane.cancellationRequested) {
+          board.updateStatus({
+            taskID,
+            state: 'cancelled',
+            resultSummary: 'cancelled',
+          });
+        }
         break;
       default:
         board.updateStatus({
@@ -174,7 +216,12 @@ function mockClient(spec: ClientSpec = {}) {
     session: {
       get: mock((input: unknown) => {
         calls.get.push(input);
-        return resolve(spec.get, { data: { parentID: 'ses_parent' } });
+        // The runtime session record carries `model`/`agent` even though the
+        // published SDK type omits them (same reason task-message reads them
+        // through unknown-shaped access). `say` needs the model to pin it.
+        return resolve(spec.get, {
+          data: { parentID: 'ses_parent', model: LIVE_MODEL },
+        });
       }) as LaneClient['session']['get'],
       messages: mock((input: unknown) => {
         calls.messages.push(input);
@@ -245,7 +292,7 @@ async function run(
 
 // ── list ──────────────────────────────────────────────────────────────
 
-describe('omo lanes list', () => {
+describe('omos lanes list', () => {
   test('explains a missing mirror without failing', async () => {
     const result = await run(['list']);
     expect(result.code).toBe(0);
@@ -438,7 +485,7 @@ describe('orchestrator guards (M1)', () => {
 
 // ── show ──────────────────────────────────────────────────────────────
 
-describe('omo lanes show', () => {
+describe('omos lanes show', () => {
   const messages = {
     data: [
       {
@@ -500,7 +547,7 @@ describe('omo lanes show', () => {
 
 // ── S2: stop ──────────────────────────────────────────────────────────
 
-describe('omo lanes stop', () => {
+describe('omos lanes stop', () => {
   test('records the intent BEFORE aborting, then verifies idle', async () => {
     seedLanes();
     seedSidecar();
@@ -604,6 +651,38 @@ describe('omo lanes stop', () => {
     expect(result.calls.abort).toHaveLength(1);
   });
 
+  test('a forced stop of a lane inactive here does not claim success (S6)', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['stop', 'fix-1', '--force'], {
+      // Idle before AND after: indistinguishable from an untouched session.
+      statuses: [{}],
+    });
+    expect(result.calls.abort).toHaveLength(1);
+    expect(result.code).toBe(1);
+    expect(result.stdout()).not.toContain('Stopped fix-1');
+    expect(result.stderr()).toContain(`Abort sent to ${SERVER_URL}`);
+    expect(result.stderr()).toContain('did not report the lane');
+    expect(result.stderr()).toContain('nothing may have');
+    expect(result.stderr()).toContain('--server');
+  });
+
+  test('a forced stop reports the inactive outcome in --json too', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['stop', 'fix-1', '--force', '--json'], {
+      statuses: [{}],
+    });
+    expect(result.code).toBe(1);
+    expect(result.json()).toMatchObject({
+      aborted: true,
+      forced: true,
+      activeBefore: false,
+      verified: false,
+      status: 'idle',
+    });
+  });
+
   test('--json reports what happened', async () => {
     seedLanes();
     seedSidecar();
@@ -648,8 +727,8 @@ describe('omo lanes stop', () => {
 
 // ── S3: say ───────────────────────────────────────────────────────────
 
-describe('omo lanes say', () => {
-  test('queues the text with the lane own agent (probe A2)', async () => {
+describe('omos lanes say', () => {
+  test('queues the text with the lane own agent and live model (A2 + MODEL)', async () => {
     seedLanes();
     seedSidecar();
     const result = await run(['say', 'fix-1', 'also update the codemap'], {
@@ -661,12 +740,137 @@ describe('omo lanes say', () => {
       query: { directory: projectDir },
       body: {
         agent: 'fixer',
+        model: PINNED_MODEL,
         parts: [{ type: 'text', text: 'also update the codemap' }],
       },
     });
     expect(result.stdout()).toContain('Queued for fix-1 (fixer)');
     // No intent line: only stop needs one.
     expect(existsSync(laneIntentsPath(projectDir))).toBe(false);
+  });
+
+  test('pins the SESSION model, not whatever the agent is configured with', async () => {
+    // The failover case: core resolves `input.model ?? agent.model ??
+    // currentModel(session)`, so an agent-only body would move this lane back
+    // onto the agent's configured primary.
+    seedLanes();
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'keep going'], {
+      statuses: [{ ses_child1: { type: 'busy' } }],
+      get: {
+        data: {
+          parentID: 'ses_parent',
+          model: { providerID: 'openai', id: 'gpt-fallback-2' },
+          variant: 'thinking',
+        },
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(
+      (result.calls.promptAsync[0] as { body: Record<string, unknown> }).body,
+    ).toEqual({
+      agent: 'fixer',
+      model: { providerID: 'openai', modelID: 'gpt-fallback-2' },
+      variant: 'thinking',
+      parts: [{ type: 'text', text: 'keep going' }],
+    });
+  });
+
+  test('accepts the promptAsync-style model shape too', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'hi'], {
+      statuses: [{ ses_child1: { type: 'busy' } }],
+      get: {
+        data: {
+          parentID: 'ses_parent',
+          model: { providerID: 'openai', modelID: 'gpt-5' },
+        },
+      },
+    });
+    expect(
+      (result.calls.promptAsync[0] as { body: { model?: unknown } }).body.model,
+    ).toEqual({ providerID: 'openai', modelID: 'gpt-5' });
+  });
+
+  test('falls back to the newest USER message model when the session omits it', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'hi'], {
+      statuses: [{ ses_child1: { type: 'busy' } }],
+      get: { data: { parentID: 'ses_parent' } },
+      messages: {
+        data: [
+          {
+            info: {
+              role: 'user',
+              model: { providerID: 'anthropic', modelID: 'old-model' },
+            },
+          },
+          {
+            info: {
+              role: 'assistant',
+              model: { providerID: 'anthropic', modelID: 'assistant-model' },
+            },
+          },
+          {
+            info: {
+              role: 'user',
+              model: { providerID: 'anthropic', modelID: 'newest-model' },
+              variant: 'default',
+            },
+          },
+        ],
+      },
+    });
+    expect(result.code).toBe(0);
+    expect(
+      (result.calls.promptAsync[0] as { body: { model?: unknown } }).body.model,
+    ).toEqual({ providerID: 'anthropic', modelID: 'newest-model' });
+  });
+
+  test('refuses when no model can be established (task_message rule)', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'hi'], {
+      statuses: [{ ses_child1: { type: 'busy' } }],
+      get: { data: { parentID: 'ses_parent' } },
+      messages: { data: [] },
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr()).toContain('current model could not be established');
+    expect(result.stderr()).toContain('CONFIGURED model');
+    expect(result.calls.promptAsync).toHaveLength(0);
+  });
+
+  test('--force sends without a model pin, and says so', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'hi', '--force'], {
+      get: { error: { message: 'boom' } },
+      messages: { error: { message: 'boom' } },
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr()).toContain('could not be pinned');
+    expect(
+      (result.calls.promptAsync[0] as { body: { model?: unknown } }).body.model,
+    ).toBeUndefined();
+  });
+
+  test('refuses a running lane whose cancellation the orchestrator owns', async () => {
+    seedLanes([{ cancellationRequested: true }]);
+    seedSidecar();
+    for (const argv of [
+      ['say', 'fix-1', 'hi'],
+      ['say', 'fix-1', 'hi', '--force'],
+    ]) {
+      const result = await run(argv, {
+        statuses: [{ ses_child1: { type: 'busy' } }],
+      });
+      expect(result.code).toBe(1);
+      expect(result.stderr()).toContain('is cancelling it right now');
+      expect(result.calls.promptAsync).toHaveLength(0);
+    }
   });
 
   test('refuses without a recorded agent, even with --force', async () => {
@@ -716,7 +920,42 @@ describe('omo lanes say', () => {
       statuses: [{}],
     });
     expect(forced.code).toBe(0);
-    expect(forced.calls.promptAsync).toHaveLength(1);
+    // S5: a note, not a turn — the lane is not running, so nothing is started.
+    expect(
+      (forced.calls.promptAsync[0] as { body: Record<string, unknown> }).body,
+    ).toEqual({
+      agent: 'fixer',
+      model: PINNED_MODEL,
+      noReply: true,
+      parts: [{ type: 'text', text: 'hello' }],
+    });
+    expect(forced.stdout()).toContain("Noted in fix-1 (fixer)'s transcript");
+    expect(forced.stdout()).toContain('nothing was started');
+  });
+
+  test('a running lane is never sent noReply (it must act on the text)', async () => {
+    seedLanes();
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'hello'], {
+      statuses: [{ ses_child1: { type: 'busy' } }],
+    });
+    expect(
+      (result.calls.promptAsync[0] as { body: { noReply?: unknown } }).body
+        .noReply,
+    ).toBeUndefined();
+  });
+
+  test('a terminal lane the orchestrator cancelled is forceable as a note', async () => {
+    seedLanes([{ state: 'cancelled', cancellationRequested: true }]);
+    seedSidecar();
+    const result = await run(['say', 'fix-1', 'context for later', '--force'], {
+      statuses: [{}],
+    });
+    expect(result.code).toBe(0);
+    expect(
+      (result.calls.promptAsync[0] as { body: { noReply?: unknown } }).body
+        .noReply,
+    ).toBe(true);
   });
 
   test('a lane the user stopped says so in the refusal', async () => {
@@ -767,6 +1006,9 @@ describe('omo lanes say', () => {
       action: 'say',
       alias: 'fix-1',
       agent: 'fixer',
+      model: PINNED_MODEL,
+      modelPinned: true,
+      noReply: false,
       queued: true,
       text: 'hi',
     });
@@ -878,14 +1120,14 @@ describe('runLanesCommand', () => {
   test('help and parse errors are reported without a stack trace', async () => {
     const help = harness();
     expect(await runLanesCommand({ command: 'help' }, help.deps)).toBe(0);
-    expect(help.stdout()).toContain('Usage: omo lanes');
+    expect(help.stdout()).toContain('Usage: omos lanes');
 
     const bad = harness();
     expect(
       await runLanesCommand({ command: 'error', message: 'nope' }, bad.deps),
     ).toBe(1);
     expect(bad.stderr()).toContain('nope');
-    expect(bad.stderr()).toContain('omo lanes --help');
+    expect(bad.stderr()).toContain('omos lanes --help');
   });
 
   test('an unexpected throw becomes one line and exit 1', async () => {

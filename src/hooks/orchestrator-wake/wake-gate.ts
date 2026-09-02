@@ -3,7 +3,7 @@
  * in-flight ownership. Shared across independently created hook instances in
  * the same JS process via globalThis + Symbol.for.
  */
-import type { ContinuationModelSelection } from '../task-session-manager/continuation-model-selection';
+import type { ContinuationModelSelection } from '../../utils/continuation-model-selection';
 
 export type WakeProgressState = {
   unchangedWakeCount: number;

@@ -1,18 +1,27 @@
 /**
- * The four `omo lanes` commands.
+ * The four `omos lanes` commands.
  *
  * All state-changing calls go straight to the OpenCode server over the SDK —
  * never through the orchestrator model — which is the entire point: the user
  * gets to inspect, steer and stop lanes for zero tokens.
  *
- * Two empirically established rules are enforced here and must not be relaxed
- * (`docs/agents/subagent-probe-results.md`):
+ * Three rules are enforced here and must not be relaxed. The first and the
+ * last are measured (`docs/agents/subagent-probe-results.md`); the middle one
+ * is read off core's own `createUserMessage`:
  *
  *   A2 — `promptAsync` MUST carry the target session's own `agent`. Omitting
  *        it rewrites `session.agent` to `build` immediately on accept, which
  *        silently converts a specialist child into a generic build session.
  *        `say` therefore refuses to run when it cannot prove the agent from
  *        the mirror, rather than guessing.
+ *   MODEL — `promptAsync` must ALSO carry the session's live model.
+ *        `createUserMessage` resolves `input.model ?? agent.model ??
+ *        currentModel(session)`, so the agent's CONFIGURED model outranks the
+ *        session's current one: an agent-only body silently re-pins a lane
+ *        that foreground fallback had moved off its primary straight back onto
+ *        the model that was failing it, variant reset included. Probe A1
+ *        passed `model` for exactly this reason. `say` reads the live model
+ *        and refuses (like `task_message`) when it cannot establish one.
  *   B2 — `abort(child)` does NOT touch the parent, but is completely silent to
  *        it. The plugin turns the resulting `session.error` into a terminal
  *        board record (and, for a revived run, synthesizes the parent
@@ -20,6 +29,10 @@
  *        to leave the *reason* behind, which is what the intent line is for.
  */
 
+import {
+  type ContinuationModelSelection,
+  parseContinuationModelSelection,
+} from '../../utils/continuation-model-selection';
 import { appendLaneIntent, laneIntentsPath } from '../../utils/lane-control';
 import type { LaneMirrorRecord } from '../../utils/lane-mirror';
 import { withAgent } from '../../utils/prompt-agent';
@@ -211,7 +224,7 @@ export function runLanesList(
   }
 
   deps.out(
-    'Next: omo lanes show <alias> | omo lanes say <alias> "…" | omo lanes stop <alias>',
+    'Next: omos lanes show <alias> | omos lanes say <alias> "…" | omos lanes stop <alias>',
   );
   return 0;
 }
@@ -236,7 +249,7 @@ interface ResolvedTarget {
  *
  * But a raw id is NOT allowed to be an orchestrator. `abort` cascades to the
  * whole session tree from either a busy or an idle parent (probes B1/B3), so
- * `omo lanes stop <parent-id>` would kill every lane at once from a command
+ * `omos lanes stop <parent-id>` would kill every lane at once from a command
  * that advertises itself as per-lane. Parent ids are easy to reach by
  * accident: `list --json` prints `parentSessionID` for every lane, and so does
  * the ambiguity error. Hence two checks:
@@ -282,7 +295,7 @@ async function resolveTarget(
     } else if (!board.exists) {
       deps.err(`No lane mirror recorded yet (${board.file}).`);
     }
-    deps.err('Run "omo lanes list" to see what is available.');
+    deps.err('Run "omos lanes list" to see what is available.');
     return 1;
   }
 
@@ -453,7 +466,7 @@ async function verifyChildSession(
     if (response.response?.status === 404) {
       deps.err(`Session ${sessionID} does not exist on ${serverUrl}.`);
       deps.err(
-        'Check the id, or point at the right server with --server (see "omo lanes list").',
+        'Check the id, or point at the right server with --server (see "omos lanes list").',
       );
       return 1;
     }
@@ -472,7 +485,7 @@ async function verifyChildSession(
     deps.err(
       `${sessionID} is a top-level session, not a background lane; aborting it kills all its lanes — use ESC in the TUI, or --force.`,
     );
-    deps.err('Run "omo lanes list" to see the lanes it owns.');
+    deps.err('Run "omos lanes list" to see the lanes it owns.');
     return 1;
   }
 
@@ -878,7 +891,7 @@ export async function runLanesStop(
         : 'Its status could not be read, so aborting could hit the wrong server.',
     );
     deps.err(
-      'Check "omo lanes list" / "omo lanes show", pass --server, or use --force.',
+      'Check "omos lanes list" / "omos lanes show", pass --server, or use --force.',
     );
     return 1;
   }
@@ -929,6 +942,12 @@ export async function runLanesStop(
     await sleep(ABORT_POLL_INTERVAL_MS);
   }
 
+  // S6: a forced abort of a lane this server never reported as active proves
+  // nothing. The post-abort `idle` reading is exactly what an untouched idle
+  // session looks like, so calling that "Stopped" would report success for a
+  // request that may have gone to the wrong server entirely.
+  const stopped = active && observed === 'idle';
+
   if (json) {
     deps.out(
       JSON.stringify(
@@ -939,7 +958,9 @@ export async function runLanesStop(
           agent: lane?.agent,
           serverUrl,
           aborted: true,
-          verified: observed === 'idle',
+          forced: force === true,
+          activeBefore: active,
+          verified: stopped,
           status: observed,
           intentRecorded: recorded,
           reason,
@@ -948,12 +969,24 @@ export async function runLanesStop(
         2,
       ),
     );
-    return observed === 'idle' ? 0 : 1;
+    return stopped ? 0 : 1;
   }
 
   const label = lane ? `${lane.alias} (${lane.agent})` : sessionID;
-  if (observed === 'idle') {
+  if (stopped) {
     deps.out(`Stopped ${label}.`);
+  } else if (!active) {
+    deps.err(
+      `Abort sent to ${serverUrl} for ${label}, but this server did not report the lane`,
+    );
+    deps.err(
+      `as active (status before: ${before}, after: ${observed}), so nothing may have`,
+    );
+    deps.err('happened.');
+    deps.err(
+      'If the lane is real, it is running on another server: find its URL and',
+    );
+    deps.err('re-run with --server.');
   } else {
     deps.err(
       `Abort accepted for ${label}, but the session is still "${observed}" after ${Math.round(
@@ -974,7 +1007,7 @@ export async function runLanesStop(
     );
     deps.out('will report this as an anonymous abort.');
   }
-  return observed === 'idle' ? 0 : 1;
+  return stopped ? 0 : 1;
 }
 
 // ── say ───────────────────────────────────────────────────────────────
@@ -993,6 +1026,66 @@ export async function runLanesStop(
  * orchestrator; those need `--force` and a clear warning. Everything else has
  * already produced its result.
  */
+/**
+ * Establish the model to pin on an injected message.
+ *
+ * Two sources, most authoritative first, mirroring `task_message`:
+ *   1. `session.get().model` (+ `variant`) — the session's CURRENT model, i.e.
+ *      whatever foreground fallback last moved it to.
+ *   2. the newest USER message's `info.model` — the last model something
+ *      actually prompted this session with, for hosts whose session record
+ *      omits it.
+ *
+ * `undefined` means "could not establish", which is a refusal (see the MODEL
+ * rule in the file header), not a licence to omit the field.
+ */
+async function resolveLaneModel(
+  client: LaneClient,
+  sessionID: string,
+  directory: string,
+): Promise<ContinuationModelSelection | undefined> {
+  try {
+    const response = await client.session.get({
+      path: { id: sessionID },
+      query: { directory },
+    });
+    if (!response?.error && isRecord(response?.data)) {
+      const selection = parseContinuationModelSelection(
+        response.data.model,
+        response.data.variant,
+      );
+      if (selection) return selection;
+    }
+  } catch {
+    // Fall through to the message log; an unreachable server is reported by
+    // the prompt call itself, not by this lookup.
+  }
+
+  try {
+    const response = await client.session.messages({
+      path: { id: sessionID },
+      query: { directory },
+    });
+    if (response?.error || !Array.isArray(response?.data)) return undefined;
+    for (let index = response.data.length - 1; index >= 0; index -= 1) {
+      const entry = response.data[index];
+      if (!isRecord(entry) || !isRecord(entry.info)) continue;
+      if (entry.info.role !== 'user') continue;
+      return parseContinuationModelSelection(
+        entry.info.model,
+        entry.info.variant,
+      );
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
 function sayabilityOf(
   lane: LaneMirrorRecord,
 ): { ok: true } | { ok: false; why: string; retained: boolean } {
@@ -1024,6 +1117,26 @@ export async function runLanesSay(
   });
   if (typeof resolved === 'number') return resolved;
   const { lane, sessionID, client, serverUrl } = resolved;
+
+  // The orchestrator's own cancellation path owns this run: `task_cancel` (or
+  // `task_revive`'s cancel-then-relaunch) holds a cancellation lease and is
+  // mid-abort. `task_message` refuses outright in this state and so does this
+  // command — not overridable while the lane is still running, because a
+  // prompt racing an in-flight abort is the one case where the two writers are
+  // guaranteed to disagree. Once the run is terminal the flag is merely
+  // history, and the normal `--force` path below applies.
+  if (lane?.cancellationRequested && lane.state === 'running') {
+    deps.err(
+      `Refusing to message ${lane.alias}: the orchestrator is cancelling it right now.`,
+    );
+    deps.err(
+      'Its cancellation lease owns the session, so a prompt would race the',
+    );
+    deps.err(
+      'abort. Wait for the lane to settle ("omos lanes list"), then decide.',
+    );
+    return 1;
+  }
 
   // S3: a message into a settled lane is almost always a mistake — it either
   // goes nowhere useful or starts a turn whose reply nobody will read. Refuse
@@ -1071,7 +1184,7 @@ export async function runLanesSay(
     );
     deps.err('command refuses to guess.');
     deps.err(
-      'Use "omo lanes list" to find a lane with a known agent, or ask the',
+      'Use "omos lanes list" to find a lane with a known agent, or ask the',
     );
     deps.err('orchestrator to message it (task_message).');
     return 1;
@@ -1104,7 +1217,7 @@ export async function runLanesSay(
         'Messaging it here could start a second, concurrent turn on a session',
       );
       deps.err(
-        'another server is mid-turn in. Check "omo lanes show", pass --server,',
+        'another server is mid-turn in. Check "omos lanes show", pass --server,',
       );
       deps.err('or use --force.');
       return 1;
@@ -1120,24 +1233,71 @@ export async function runLanesSay(
     }
   }
 
+  // MODEL rule (see the file header): resolve the lane's live model and pin
+  // it, or refuse. Omitting the field does not mean "keep the current model";
+  // it means core falls back to the AGENT's configured model, which undoes a
+  // foreground-fallback failover behind the user's back.
+  const pinned = await resolveLaneModel(client, sessionID, directory);
+  if (!pinned && !force) {
+    deps.err(
+      `Refusing to message ${lane?.alias ?? sessionID}: its current model could not be established.`,
+    );
+    deps.err(
+      'A prompt without an explicit model is resolved against the agent\u2019s',
+    );
+    deps.err(
+      'CONFIGURED model, which would silently move this lane back onto it —',
+    );
+    deps.err(
+      'undoing any fallback that had switched it away. `task_message` refuses',
+    );
+    deps.err('for the same reason.');
+    deps.err(
+      'Check the server is reachable ("omos lanes show"), or use --force to',
+    );
+    deps.err('send without a model pin.');
+    return 1;
+  }
+  if (!pinned) {
+    deps.err(
+      `Forcing: ${lane?.alias ?? sessionID}'s model could not be pinned, so this prompt may`,
+    );
+    deps.err("re-pin the lane to its agent's configured model.");
+  }
+
+  // A note into a lane that is not running must not START one. `noReply` makes
+  // the text land in the transcript without a turn, so the next `task_revive`
+  // (or a resume by the orchestrator) reads it as context instead of the user
+  // getting an answer nobody will ever see. Running lanes keep the probe-A1
+  // behaviour: queued, picked up after the current step.
+  const quiet = lane !== undefined && lane.state !== 'running';
+
   // No intent line is written here. Only `stop` needs one (to label the abort
   // it is about to cause); a `say` intent would have no reader, and an unread
   // copy of the user's prompt text on disk is a liability, not an audit trail.
   //
-  // `promptAsync` (not `prompt`) because probe A1 measured exactly this call
-  // against a running child: HTTP 204 immediately, queued, processed after the
-  // current step, session agent unchanged. The orchestrator-side `task_message`
-  // uses the blocking `prompt` with `noReply` and an authoritative model pin;
-  // that path also generates a reply, and its model lookup lives in
-  // `src/hooks/`, which the CLI must not import. Passing the lane's own agent
-  // (and only that) is what the probe validated, and matching agents mean the
-  // server never reaches its setAgentModel path.
+  // `promptAsync` (not the blocking `prompt` that `task_message` uses) because
+  // probe A1 measured exactly this call against a running child: HTTP 204
+  // immediately, queued, processed after the current step, session agent and
+  // model unchanged.
   let response: LaneSdkResponse;
   try {
     response = await client.session.promptAsync({
       path: { id: sessionID },
       query: { directory },
-      body: withAgent({ parts: [{ type: 'text', text }] }, agent),
+      body: withAgent(
+        {
+          ...(pinned
+            ? {
+                model: pinned.model,
+                ...(pinned.variant ? { variant: pinned.variant } : {}),
+              }
+            : {}),
+          ...(quiet ? { noReply: true } : {}),
+          parts: [{ type: 'text', text }],
+        },
+        agent,
+      ),
     });
   } catch (error) {
     return reportUnreachable(deps, serverUrl, error);
@@ -1158,6 +1318,10 @@ export async function runLanesSay(
           sessionID,
           alias: lane?.alias,
           agent,
+          model: pinned?.model,
+          variant: pinned?.variant,
+          modelPinned: pinned !== undefined,
+          noReply: quiet,
           serverUrl,
           queued: true,
           text,
@@ -1169,7 +1333,22 @@ export async function runLanesSay(
     return 0;
   }
 
-  deps.out(`Queued for ${lane ? `${lane.alias} (${agent})` : sessionID}:`);
+  const target = lane ? `${lane.alias} (${agent})` : sessionID;
+  if (quiet) {
+    deps.out(`Noted in ${target}'s transcript:`);
+    deps.out(`  ${truncate(text, 200)}`);
+    deps.out('');
+    deps.out(
+      'The lane is not running, so nothing was started: the text is queued in',
+    );
+    deps.out(
+      'the session as a note. Whoever resumes it next — task_revive, or the',
+    );
+    deps.out('orchestrator picking the lane back up — reads it as context.');
+    return 0;
+  }
+
+  deps.out(`Queued for ${target}:`);
   deps.out(`  ${truncate(text, 200)}`);
   deps.out('');
   deps.out(

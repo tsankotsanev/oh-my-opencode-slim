@@ -511,7 +511,9 @@ Three kinds of lane are silent by design and are never flagged:
   is byte-identical to a freeze. Any unfinished tool part in the last assistant
   message exempts the lane, subject only to an internal 30-minute backstop.
 - **Waiting for a human.** A child blocked on a **permission prompt** is
-  stamped `awaitingPermission` from its own `permission.updated` event and is
+  stamped `awaitingPermission` from its own `permission.asked` event (core's
+  in-process name; the HTTP event stream calls the same thing
+  `permission.updated`, and both are accepted) and is
   exempt for as long as the stamp stands; the board renders
   `Waiting: permission for <tool>` so the pause is legible instead of
   suspicious. The stamp is dropped on `permission.replied`, on any output from
@@ -655,16 +657,16 @@ session deletion retry, or worker-death guarantee is implied.
 ### Controlling lanes from a second terminal
 
 Every question about a background lane normally costs an orchestrator turn: the
-model is the only thing that can reach a child session. `omo lanes` removes
+model is the only thing that can reach a child session. `omos lanes` removes
 that cost by talking to the OpenCode server directly with the SDK, from any
 other shell, for **zero tokens and zero model turns**.
 
 ```bash
-omo lanes                              # what is running here?
-omo lanes list --json                  # same, for scripts
-omo lanes show fix-1 -n 5              # tail of a lane's transcript
-omo lanes say fix-1 "also update the codemap"
-omo lanes stop ora-2 --reason "wrong file set"
+omos lanes                              # what is running here?
+omos lanes list --json                  # same, for scripts
+omos lanes show fix-1 -n 5              # tail of a lane's transcript
+omos lanes say fix-1 "also update the codemap"
+omos lanes stop ora-2 --reason "wrong file set"
 ```
 
 Options: `--dir <path>` (project, default cwd), `--server <url>`,
@@ -707,18 +709,20 @@ the agent rule.
 | Raw `ses_…` whose parentage cannot be read | Refused — unknown parentage fails closed | Proceeds without the check |
 | Sidecar's directory ≠ target directory | **Hard refusal, never forceable**: a recycled port could put you in another project's sessions | still refused |
 | Sidecar pid dead, or heartbeat older than 3 refresh intervals (6 min) | Treated as stale; asks for `--server` or a restart | n/a (pass `--server`) |
-| `stop` on a lane that is not `busy`/`retry` on this server | Refused, and **no intent is written** | Aborts anyway |
-| `stop` on a `stopped`/`error` lane the server confirms idle | Exit 0, `already stopped; recorded` — the abort is skipped, the cancellation is still recorded | same |
+| `stop` on a lane that is not `busy`/`retry` on this server | Refused, and **no intent is written** | Abort is sent, but the result is reported as *"nothing may have happened"* and exits 1 — an idle session after an abort is indistinguishable from an untouched one |
+| `stop` on a `stopped`/`error` lane the server confirms idle | Exit 0, `already stopped; recorded` — the abort is skipped, the cancellation is still recorded (and claimed by the plugin on its next mirror flush) | same |
 | `say` to a `running` lane that is not busy *here* | Refused: prompting it could start a second concurrent turn on a session another server is mid-turn in (corruption class) | Sends anyway |
 | `say` to a `running, status uncertain` lane | Warned, then sent — an idle reading is exactly what that flag means | Sends without the check |
-| `say` to a `stopped`/`error` lane | Refused: the session exists, but no reply will reach the orchestrator — ask it for `task_revive` instead | Sends anyway |
-| `say` to a `completed`/`cancelled`/`reconciled` lane | Refused: it already produced its result | Sends anyway |
+| `say` to a `running` lane whose cancellation the orchestrator owns (`cancellationRequested`) | **Refused, never forceable**: a prompt racing an in-flight abort is guaranteed to disagree with it | still refused |
+| `say` to a `stopped`/`error` lane | Refused: the session exists, but no reply will reach the orchestrator — ask it for `task_revive` instead | Sent with `noReply`, so the text is left in the transcript as a note for whoever resumes the lane, without starting a turn |
+| `say` to a `completed`/`cancelled`/`reconciled` lane | Refused: it already produced its result | Same as above — a note, not a turn |
 | `say` with no recorded agent | **Refused, never forceable**: a prompt without the session's own `agent` permanently rewrites that session to the default `build` agent | still refused |
+| `say` when the lane's current model cannot be established | Refused, exactly as `task_message` does — see below | Sends unpinned, and says that the lane may be re-pinned to its agent's configured model |
 
 `stop` writes its intent *before* aborting, because the plugin sees the
 resulting `session.error(MessageAbortedError)` within milliseconds. It claims
 that line and labels the record — `Stopped by: the user, from a second terminal
-(omo lanes stop): <reason>` plus an `Action:` line telling the orchestrator not
+(omos lanes stop): <reason>` plus an `Action:` line telling the orchestrator not
 to relaunch it unasked — so the cancellation reaches the model on its next turn
 at no token cost. The label is exactly that: a label. The state stays whatever
 the lifecycle recorded (`error` for an abort), which keeps the lane revivable in
@@ -729,6 +733,25 @@ after 60s for attribution, and are pruned after 10 minutes.
 `stop` also verifies rather than assumes: an accepted abort that does not leave
 the session idle within 5s exits 1 and says so.
 
+**`say` pins two identities, not one.** Passing the lane's own `agent` is the
+better-known rule (probe A2: omit it and the session is rewritten to `build`),
+but the model matters just as much and fails in the opposite direction. Core's
+`createUserMessage` resolves `input.model ?? agent.model ?? currentModel(session)`,
+so the agent's *configured* model outranks the session's *current* one: a body
+carrying only `agent` moves a lane that foreground fallback had switched away
+from its primary straight back onto it, variant reset included. `say` therefore
+reads the lane's live model (`session.get`, falling back to the newest user
+message) and pins it explicitly — and refuses to send if it cannot establish
+one, which is the same rule `task_message` applies.
+
+**Data at rest.** The mirror and sidecar hold lane aliases, agent names, session
+ids, the task objective and the last progress excerpt, capped at 300 characters
+per text field. That is the same class of content OpenCode itself already keeps
+under `~/.local/share/opencode/storage` (full message logs included), in the
+same user-owned directory tree, so lane control adds no new exposure — but it
+is not encrypted either. Set `backgroundJobs.laneControl: false` to write
+nothing at all.
+
 **Multi-server caveat.** The sidecar is last-writer-wins. If two servers share
 one project directory (a TUI plus an `opencode serve`), the file names whichever
 started or refreshed last, and the other one's lanes are reachable only with an
@@ -736,10 +759,10 @@ explicit `--server`. This is why `say` insists a `running` lane be busy on the
 server it is about to talk to.
 
 Multiplexer panes are titled `fix-1 · <session title>` so a pane maps to the
-same alias the board, `omo lanes` and `task_message` use.
+same alias the board, `omos lanes` and `task_message` use.
 
 Turning this off (`backgroundJobs.laneControl: false`) stops all three files
-from being written or read; `omo lanes list` then explains that the mirror is
+from being written or read; `omos lanes list` then explains that the mirror is
 missing, and orchestration is otherwise unaffected.
 
 ---

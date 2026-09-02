@@ -1,5 +1,5 @@
 /**
- * JSON mirror of the Background Job Board, written for the `omo lanes` CLI.
+ * JSON mirror of the Background Job Board, written for the `omos lanes` CLI.
  *
  * # This file is NOT a truth source. Ever.
  *
@@ -75,14 +75,28 @@ export interface LaneMirrorRecord {
   objective?: string;
   state: BackgroundJobState;
   statusUncertain: boolean;
+  /**
+   * The orchestrator's own cancellation path owns this run.
+   *
+   * Published because it is a refusal input for the CLI, exactly as it is for
+   * `task_message`: a lane whose cancellation lease is held must not be
+   * prompted from a second terminal.
+   */
+  cancellationRequested: boolean;
   /** True while the parent has not yet been told about a terminal outcome. */
   terminalUnreconciled: boolean;
   lastStatusError?: string;
   resultSummary?: string;
   lastProgress?: LaneProgress;
-  /** Set while a permission prompt for this lane is open. */
+  /**
+   * Set while a permission prompt for this lane is open.
+   *
+   * Deliberately narrower than the board's `AwaitingPermission`: the request id
+   * exists to fence the plugin's own clear and is of no use to a reader, so it
+   * is stripped rather than published.
+   */
   awaitingPermission?: { tool: string; at: number };
-  /** Set when a `omo lanes stop` was attributed to this lane's abort. */
+  /** Set when a `omos lanes stop` was attributed to this lane's abort. */
   cancelledByUser?: { at: number; reason?: string };
   launchedAt: number;
   updatedAt: number;
@@ -120,7 +134,7 @@ function storageRoot(): string {
  * Directory holding every per-project lane artefact (board mirror, server
  * sidecar, control intents).
  *
- * Exported so the `omo lanes` CLI resolves exactly the same location the
+ * Exported so the `omos lanes` CLI resolves exactly the same location the
  * plugin writes to — a second implementation of this path would silently
  * diverge the moment either side changed.
  */
@@ -171,23 +185,53 @@ export function laneMirrorPath(directory: string): string {
   return path.join(laneStateDir(), `${laneStateKey(directory)}.json`);
 }
 
+/**
+ * Cap on free-text fields copied into the mirror.
+ *
+ * `objective` is a slice of the original task prompt and `resultSummary` can
+ * carry a whole provider error, so both are unbounded in principle. The mirror
+ * is a listing, not an archive: the CLI truncates these for display anyway,
+ * and `omos lanes show` reads the real transcript from the server when the full
+ * text matters. Keeping the file small also keeps a once-per-second atomic
+ * rewrite cheap.
+ */
+const MIRROR_TEXT_LIMIT = 300;
+
+function mirrorText(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  return normalized.length <= MIRROR_TEXT_LIMIT
+    ? normalized
+    : `${normalized.slice(0, MIRROR_TEXT_LIMIT - 1)}\u2026`;
+}
+
 /** Project the in-process record onto the narrow mirror shape. */
 export function toLaneMirrorRecord(job: BackgroundJobRecord): LaneMirrorRecord {
+  const objective = mirrorText(job.objective);
+  const lastStatusError = mirrorText(job.lastStatusError);
+  const resultSummary = mirrorText(job.resultSummary);
   return {
     alias: job.alias,
     sessionID: job.taskID,
     parentSessionID: job.parentSessionID,
     agent: job.agent,
-    label: job.description,
-    ...(job.objective ? { objective: job.objective } : {}),
+    label: mirrorText(job.description) ?? '',
+    ...(objective ? { objective } : {}),
     state: job.state,
     statusUncertain: job.statusUncertain,
+    cancellationRequested: job.cancellationRequested,
     terminalUnreconciled: job.terminalUnreconciled,
-    ...(job.lastStatusError ? { lastStatusError: job.lastStatusError } : {}),
-    ...(job.resultSummary ? { resultSummary: job.resultSummary } : {}),
+    ...(lastStatusError ? { lastStatusError } : {}),
+    ...(resultSummary ? { resultSummary } : {}),
     ...(job.lastProgress ? { lastProgress: job.lastProgress } : {}),
     ...(job.awaitingPermission
-      ? { awaitingPermission: job.awaitingPermission }
+      ? {
+          awaitingPermission: {
+            tool: job.awaitingPermission.tool,
+            at: job.awaitingPermission.at,
+          },
+        }
       : {}),
     ...(job.cancelledByUser ? { cancelledByUser: job.cancelledByUser } : {}),
     launchedAt: job.launchedAt,
@@ -260,15 +304,27 @@ export function writeLaneMirror(
 }
 
 export interface LaneMirrorOptions {
-  /** Current lanes. Called only when a write actually happens. */
+  /** Current lanes. Read once per flush, only when a flush is due. */
   lanes: () => BackgroundJobRecord[];
   directory: string;
   enabled: boolean;
   /**
-   * Called after every mirror write. Used to piggyback the server sidecar's
-   * heartbeat on an event that already means "the board changed", instead of
-   * giving the sidecar its own change feed. Must not throw; failures are
-   * swallowed.
+   * Called at the start of a flush, before the board is read.
+   *
+   * For last-moment bookkeeping that should be visible in the file being
+   * written (claiming pending CLI stop intents). Runs at most once per
+   * `minWriteIntervalMs`, so it is a safe place for one small disk read that
+   * would be far too expensive on the event path. Must not throw; failures
+   * are swallowed.
+   */
+  onBeforeFlush?: () => void;
+  /**
+   * Called after a flush.
+   *
+   * Used to piggyback the server sidecar's heartbeat on the mirror's own
+   * cadence instead of giving it a second timer. Note that a flush means "the
+   * plugin looked", not "something changed" — it fires even when the write is
+   * skipped as a no-op. Must not throw; failures are swallowed.
    */
   onFlush?: () => void;
   /** Test seams. */
@@ -282,12 +338,57 @@ export interface LaneMirrorOptions {
 export interface LaneMirror {
   /** Absolute mirror path (useful for logs and tests). */
   readonly file: string;
-  /** Debounced write; safe to call on every event. */
+  /** Debounced flush; safe to call on every event. */
   scheduleFlush(): void;
-  /** Write immediately, cancelling any pending debounce. */
+  /** Flush immediately, cancelling any pending debounce. */
   flushNow(): void;
-  /** Flush anything pending and stop scheduling. */
+  /** Flush once more, then stop scheduling. */
   dispose(): void;
+}
+
+/**
+ * Live lane-control writers per project directory.
+ *
+ * The plugin factory re-runs on every config update, so a long-lived server
+ * builds several hook generations for one directory. Without this registry the
+ * previous generation's mirror timer and sidecar heartbeat keep running
+ * against a board nobody reads any more, and both generations race the same
+ * two files. Module-level (not per-hook) precisely because the new generation
+ * has no reference to the old one.
+ */
+const laneWritersByDirectory = new Map<string, () => void>();
+
+/**
+ * Dispose the lane-control writers a previous plugin generation left running
+ * for `directory`, and register `dispose` as the current owner.
+ *
+ * Returns nothing and never throws: a failed teardown of a dead generation
+ * must not stop the new one from starting.
+ */
+export function claimLaneWriters(directory: string, dispose: () => void): void {
+  const key = canonicalDirectory(directory);
+  const previous = laneWritersByDirectory.get(key);
+  laneWritersByDirectory.set(key, dispose);
+  if (!previous) return;
+  try {
+    previous();
+  } catch (error) {
+    log('[lane-mirror] previous generation teardown failed', {
+      directory: key,
+      error: String(error),
+    });
+  }
+}
+
+/** Forget the current owner for `directory` (called from its own dispose). */
+export function releaseLaneWriters(
+  directory: string,
+  dispose: () => void,
+): void {
+  const key = canonicalDirectory(directory);
+  if (laneWritersByDirectory.get(key) === dispose) {
+    laneWritersByDirectory.delete(key);
+  }
 }
 
 /**
@@ -308,12 +409,22 @@ export function createLaneMirror(options: LaneMirrorOptions): LaneMirror {
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let lastWriteAt = Number.NEGATIVE_INFINITY;
+  /** Serialized body of the last write, minus `savedAt`, for no-op detection. */
+  let lastBody: string | undefined;
+  /** When the published content last actually changed. */
+  let lastChangedAt = 0;
   let dirty = false;
   let disposed = false;
 
   function write(): void {
     dirty = false;
-    lastWriteAt = now();
+    const at = now();
+    lastWriteAt = at;
+    try {
+      options.onBeforeFlush?.();
+    } catch {
+      // Bookkeeping must never break the mirror write path.
+    }
     let lanes: BackgroundJobRecord[] = [];
     try {
       lanes = options.lanes();
@@ -321,12 +432,29 @@ export function createLaneMirror(options: LaneMirrorOptions): LaneMirror {
       log('[lane-mirror] snapshot failed', { file, error: String(error) });
       return;
     }
-    writeLaneMirror(file, {
+
+    const records = lanes.map(toLaneMirrorRecord);
+    // Compare the content WITHOUT the timestamp, then stamp the file with the
+    // moment the content last changed. A flush is scheduled by events, most of
+    // which do not touch any lane, so most flushes have nothing new to say;
+    // rewriting the same bytes with a fresh `savedAt` would burn a syscall per
+    // second and make every reader think the board had just moved.
+    const body = JSON.stringify({
       version: LANE_MIRROR_VERSION,
-      savedAt: lastWriteAt,
       directory,
-      lanes: lanes.map(toLaneMirrorRecord),
+      lanes: records,
     });
+    if (body !== lastBody) {
+      lastBody = body;
+      lastChangedAt = at;
+      writeLaneMirror(file, {
+        version: LANE_MIRROR_VERSION,
+        savedAt: lastChangedAt,
+        directory,
+        lanes: records,
+      });
+    }
+
     try {
       options.onFlush?.();
     } catch {
@@ -371,10 +499,11 @@ export function createLaneMirror(options: LaneMirrorOptions): LaneMirror {
     dispose(): void {
       if (disposed) return;
       clearTimer();
-      // One unconditional final write, not just a pending-flush: board changes
-      // do not all arrive with an event behind them, so "nothing is dirty"
-      // does not prove the file matches the board. The last thing a CLI reads
-      // after the server exits should be the truth as of shutdown.
+      // One final flush regardless of the debounce state: board changes do not
+      // all arrive with an event behind them, so "nothing is dirty" does not
+      // prove the file matches the board. The last thing a CLI reads after the
+      // server exits should be the truth as of shutdown. The no-op check still
+      // applies, so an unchanged mirror is left exactly as it is.
       if (options.enabled) write();
       disposed = true;
     },

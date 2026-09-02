@@ -133,7 +133,7 @@ describe('parseLanesArgs', () => {
     const parsed = parseLanesArgs(['fix-1']);
     expect(parsed).toMatchObject({
       command: 'error',
-      message: expect.stringContaining('omo lanes show fix-1'),
+      message: expect.stringContaining('omos lanes show fix-1'),
     });
   });
 
@@ -167,7 +167,7 @@ describe('parseLanesArgs', () => {
 
   test('help text documents every command and the force caveat', () => {
     for (const fragment of [
-      'omo lanes',
+      'omos lanes',
       'list',
       'show',
       'stop',

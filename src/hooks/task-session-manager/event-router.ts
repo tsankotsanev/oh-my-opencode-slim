@@ -270,7 +270,7 @@ function activityEventMessageID(input: {
  * True when this activity event describes a message written INTO the lane
  * instead of output produced BY it.
  *
- * `task_message` (and the planned `omo lanes say`) prompt a child directly,
+ * `task_message` (and the planned `omos lanes say`) prompt a child directly,
  * which makes the host emit `message.updated` for the new user message plus
  * part events for its text. Counting those as lane activity would let an
  * operator poking a frozen child silently clear its silence flag and buy it
@@ -315,14 +315,18 @@ function isInjectedUserMessageEvent(
 /**
  * Permission events that arm the HITL stamp on a lane.
  *
- * The installed SDK (1.18.x) declares `permission.updated` for the ask and
- * `permission.replied` for the answer; `permission.asked` does not exist in
- * its event union, but upstream's input-wait tracker still listens for it, so
- * both names are accepted here rather than betting on one host version.
+ * `permission.asked` is the real, in-process name: plugins receive core's own
+ * event bus, where the ask is
+ * `{ type: 'permission.asked', properties: { id, sessionID, permission,
+ * patterns, metadata, always, tool? } }` (this is also the shape upstream's
+ * `input-wait-tracker` matches, correctly). The published SDK event union
+ * instead describes the HTTP `/event` stream, which translates the ask into
+ * `permission.updated` with a `type`/`title` payload. Both names and both
+ * payload shapes are accepted here rather than betting on one transport.
  */
 const PERMISSION_ASK_EVENTS = new Set([
-  'permission.updated',
   'permission.asked',
+  'permission.updated',
 ]);
 
 /** Events that resolve a permission prompt (reply, rejection, cancellation). */
@@ -332,27 +336,41 @@ const PERMISSION_RESOLVE_EVENTS = new Set([
   'permission.cancelled',
 ]);
 
-/** Permission-type names are plain identifiers (`bash`, `edit`, `webfetch`). */
+/** Permission names are plain identifiers (`bash`, `edit`, `webfetch`). */
 const PERMISSION_TOOL_PATTERN = /^[\w.:-]{1,40}$/;
 
 /**
  * What the lane is asking permission for.
  *
- * `properties.type` is the permission type, which for tool permissions IS the
- * tool name; `title` is the human sentence and only used when the type is
- * missing or not a plain name. Truncated because it is rendered into the
+ * Candidate order follows the transports: `permission` is core's in-process
+ * field (and the one that actually reaches a plugin), `type` is the SDK/HTTP
+ * translation of the same value, and `title` is the human sentence used only
+ * when neither names the tool. Truncated because it is rendered into the
  * board.
  */
 function permissionToolName(properties: unknown): string | undefined {
   const props = isRecord(properties) ? properties : undefined;
-  const type = typeof props?.type === 'string' ? props.type.trim() : '';
-  if (type && PERMISSION_TOOL_PATTERN.test(type)) return type;
-  const title = typeof props?.title === 'string' ? props.title.trim() : '';
-  if (title) return title.slice(0, 60);
-  return type || undefined;
+  const candidates = [props?.permission, props?.type, props?.title];
+  const named: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    if (PERMISSION_TOOL_PATTERN.test(trimmed)) return trimmed;
+    named.push(trimmed);
+  }
+  const fallback = named[0];
+  return fallback ? fallback.slice(0, 60) : undefined;
 }
 
-/** Permission request id, across the two spellings hosts have used. */
+/**
+ * Permission request id, across the spellings the two transports use.
+ *
+ * Core's reply carries `requestID` (`{ sessionID, requestID, reply }`); the
+ * SDK's `permission.replied` carries `permissionID`. The ask carries `id` in
+ * both. Order matters: reading the wrong field yields `undefined`, which would
+ * clear a stamp the reply did not answer.
+ */
 function permissionRequestID(
   properties: unknown,
   kind: 'ask' | 'resolve',
@@ -361,7 +379,7 @@ function permissionRequestID(
   const candidates =
     kind === 'ask'
       ? [props?.id, props?.permissionID, props?.requestID]
-      : [props?.permissionID, props?.requestID, props?.id];
+      : [props?.requestID, props?.permissionID, props?.id];
   const found = candidates.find(
     (value) => typeof value === 'string' && value.length > 0,
   );
@@ -481,7 +499,7 @@ export async function handleEvent(
     observeSyntheticTerminalPart?: (part: unknown) => void;
     revivedRunTracker?: RevivedRunTracker;
     /**
-     * Lane control: claim the `omo lanes stop` intent that explains an abort
+     * Lane control: claim the `omos lanes stop` intent that explains an abort
      * of this lane, if the CLI wrote one in the last minute. Returns
      * `undefined` for the normal case (no user stop), and is absent entirely
      * when `backgroundJobs.laneControl` is off.
@@ -520,11 +538,12 @@ export async function handleEvent(
   }
 
   // HITL seam for CHILD lanes. Upstream's input-wait tracker (consulted above)
-  // only follows orchestrator sessions, so without this a lane parked on a
-  // permission prompt looks identical to a frozen one: silence detection would
-  // eventually flag it, and neither the board nor `omo lanes list` could say
-  // why it went quiet. The stamp lives on the lane's own board record, so it
-  // needs no second tracker and dies with the run.
+  // reads the same events but is scoped to ORCHESTRATOR sessions
+  // (`shouldManageSession`), so without this a lane parked on a permission
+  // prompt looks identical to a frozen one: silence detection would eventually
+  // flag it, and neither the board nor `omos lanes list` could say why it went
+  // quiet. The stamp lives on the lane's own board record, so it needs no
+  // second tracker and dies with the run.
   if (PERMISSION_ASK_EVENTS.has(input.event.type)) {
     const sessionID = input.event.properties?.sessionID;
     const tool = permissionToolName(input.event.properties);
@@ -858,7 +877,7 @@ export async function handleEvent(
           });
         }
         // An abort is the only outcome a second terminal can cause, so this is
-        // the one place a `omo lanes stop` can be attributed. The claim is
+        // the one place a `omos lanes stop` can be attributed. The claim is
         // pull-based and consumes the line, so a later abort of the same lane
         // cannot inherit the label; the board itself refuses to overwrite an
         // orchestrator-owned cancellation.
@@ -871,7 +890,7 @@ export async function handleEvent(
                 sessionId,
                 intent.reason,
               ) ?? updated;
-            log('[task-session-manager] lane stopped by user (omo lanes)', {
+            log('[task-session-manager] lane stopped by user (omos lanes)', {
               sessionID: sessionId,
               alias: terminal.alias,
               state: terminal.state,

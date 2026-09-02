@@ -4,7 +4,7 @@
  * There is no dedicated API for this. The multiplexer already had to solve it
  * to spawn `opencode attach <serverUrl> --session <id>` panes; this module is
  * that logic, extracted so the pane spawner, the lane-control server sidecar
- * (`src/utils/lane-control.ts`) and the `omo lanes` CLI can never disagree
+ * (`src/utils/lane-control.ts`) and the `omos lanes` CLI can never disagree
  * about which server they are talking to.
  *
  * Resolution order:
@@ -29,7 +29,7 @@
  *
  * Set it on the OpenCode server AND read it from the second terminal:
  *   OMO_OPENCODE_SERVER_URL=http://127.0.0.1:4096 opencode
- * The `omo lanes` CLI honours the same variable, so it works without a
+ * The `omos lanes` CLI honours the same variable, so it works without a
  * sidecar file or an explicit `--server`.
  */
 export const SERVER_URL_ENV = 'OMO_OPENCODE_SERVER_URL';
@@ -122,7 +122,7 @@ export function createServerUrlResolver(ctx: {
  * Resolver for lane control: the context sources, then {@link SERVER_URL_ENV}.
  *
  * The env fallback exists for the sidecar because the alternative is not "a
- * slightly wrong URL" but "no `omo lanes` at all": with no in-process URL the
+ * slightly wrong URL" but "no `omos lanes` at all": with no in-process URL the
  * plugin cannot publish where it lives, and the user's only recourse is to
  * pass `--server` on every single command. The variable is read from the same
  * name on both sides, so a user who sets it has stated the URL explicitly.

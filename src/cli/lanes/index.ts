@@ -1,5 +1,5 @@
 /**
- * `omo lanes` — zero-token control surface for background subagent lanes.
+ * `omos lanes` — zero-token control surface for background subagent lanes.
  *
  * Entry point only: parsing lives in `./args`, the lane-mirror reader in
  * `./board`, server discovery in `./server`, and the commands in
@@ -55,7 +55,7 @@ function defaultDeps(): LanesDeps {
 /**
  * Run a parsed command. Returns a process exit code; never throws.
  *
- * The blanket catch is deliberate: `omo lanes` is reached for when something
+ * The blanket catch is deliberate: `omos lanes` is reached for when something
  * is already wrong, and a Node stack trace on top of that is noise, not
  * information.
  */
@@ -70,7 +70,7 @@ export async function runLanesCommand(
   if (parsed.command === 'error') {
     deps.err(parsed.message);
     deps.err('');
-    deps.err('Run "omo lanes --help" for usage.');
+    deps.err('Run "omos lanes --help" for usage.');
     return 1;
   }
 
@@ -119,7 +119,7 @@ export async function runLanesCommand(
     }
   } catch (error) {
     deps.err(
-      `omo lanes failed: ${error instanceof Error ? error.message : String(error)}`,
+      `omos lanes failed: ${error instanceof Error ? error.message : String(error)}`,
     );
     return 1;
   }
