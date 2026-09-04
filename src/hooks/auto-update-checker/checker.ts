@@ -6,6 +6,7 @@ import {
   stripJsonComments,
 } from '../../cli/config-manager';
 import { getTuiConfig, getTuiConfigJsonc } from '../../cli/paths';
+import { PACKAGE_NAME_ALIASES } from '../../config/package-identity';
 import { INSTALLER_MANAGED_PLUGIN_OPTION } from '../../plugin-entry';
 import { log } from '../../utils/logger';
 import {
@@ -357,7 +358,12 @@ function getLocalDevPath(directory: string): string | null {
       for (const entry of plugins) {
         const spec = getPluginSpec(entry);
         if (!spec) continue;
-        if (spec.startsWith('file://') && spec.includes(PACKAGE_NAME)) {
+        // Alias-tolerant on purpose: failing to recognise a local checkout
+        // would let the auto-updater overwrite a development install.
+        if (
+          spec.startsWith('file://') &&
+          PACKAGE_NAME_ALIASES.some((name) => spec.includes(name))
+        ) {
           try {
             return fileURLToPath(spec);
           } catch {
@@ -384,7 +390,10 @@ function findPackageJsonUp(startPath: string): string | null {
         try {
           const content = fs.readFileSync(pkgPath, 'utf-8');
           const pkg = JSON.parse(content) as PackageJson;
-          if (pkg.name === PACKAGE_NAME) return pkgPath;
+          // Accepts the upstream name too, so a cache still holding the
+          // pre-fork package resolves its version and can be migrated.
+          if (pkg.name !== undefined && PACKAGE_NAME_ALIASES.includes(pkg.name))
+            return pkgPath;
         } catch {
           /* empty */
         }

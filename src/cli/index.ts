@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { PACKAGE_NAME } from '../config/package-identity';
 import { doctor, parseDoctorArgs } from './doctor';
 import { install } from './install';
 import { lanes } from './lanes';
@@ -71,12 +72,12 @@ export function parseArgs(args: string[]): InstallArgs {
 
 function printHelp(): void {
   console.log(`
-oh-my-opencode-slim installer
+${PACKAGE_NAME} installer
 
 Usage:
-  bunx oh-my-opencode-slim install [OPTIONS]
-  bunx oh-my-opencode-slim doctor [OPTIONS]
-  omos lanes [list|show|stop|say] [OPTIONS]
+  bunx ${PACKAGE_NAME} install [OPTIONS]
+  bunx ${PACKAGE_NAME} doctor [OPTIONS]
+  omos lanes [list|show|stop|say|revive] [OPTIONS]
 
 Options:
   --skills=yes|no|force  Install bundled skills; force replaces existing skill
@@ -103,6 +104,8 @@ Lane control (second terminal, zero orchestrator turns):
   omos lanes stop <alias> Abort one lane (its session survives)
   omos lanes say <alias> "…"
                          Queue an instruction for a running lane
+  omos lanes revive <alias>
+                         Relaunch a lane killed by an abort cascade
   omos lanes --help       Full lane options
 
 Available presets: ${getGeneratedPresetNames().join(', ')}
@@ -112,12 +115,12 @@ OpenAI is active unless --preset selects another generated preset.
 For the full config reference, see docs/configuration.md.
 
 Examples:
-  bunx oh-my-opencode-slim install
-  bunx oh-my-opencode-slim install --no-tui --skills=yes
-  bunx oh-my-opencode-slim install --background-subagents=yes
-  bunx oh-my-opencode-slim install --preset=opencode-go
-  bunx oh-my-opencode-slim install --reset
-  bunx oh-my-opencode-slim doctor
+  bunx ${PACKAGE_NAME} install
+  bunx ${PACKAGE_NAME} install --no-tui --skills=yes
+  bunx ${PACKAGE_NAME} install --background-subagents=yes
+  bunx ${PACKAGE_NAME} install --preset=opencode-go
+  bunx ${PACKAGE_NAME} install --reset
+  bunx ${PACKAGE_NAME} doctor
 `);
 }
 

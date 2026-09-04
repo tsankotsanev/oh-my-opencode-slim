@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -15,6 +16,11 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distEntry = path.join(repoRoot, 'dist', 'index.js');
+const packageName = (
+  JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
+    name: string;
+  }
+).name;
 const opencodeVersion = process.env.OPENCODE_SMOKE_VERSION?.trim() || 'latest';
 
 function fail(message: string): never {
@@ -214,7 +220,7 @@ async function verifyHostSmoke(tarballPath: string) {
         {
           type: 'module',
           dependencies: {
-            'oh-my-opencode-slim': `file:${tarballTarget}`,
+            [packageName]: `file:${tarballTarget}`,
           },
         },
         null,
@@ -223,7 +229,7 @@ async function verifyHostSmoke(tarballPath: string) {
     );
     writeFileSync(
       path.join(pluginDir, 'load-oh-my-opencode-slim.js'),
-      "export { default } from 'oh-my-opencode-slim';\n",
+      `export { default } from '${packageName}';\n`,
     );
 
     const config = JSON.stringify({

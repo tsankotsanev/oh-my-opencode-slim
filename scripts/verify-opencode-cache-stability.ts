@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PHASE_REMINDER, PHASE_REMINDER_TEXT } from '../src/config/constants';
+import { PACKAGE_NAME } from '../src/config/package-identity';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -484,21 +485,20 @@ async function main() {
     const plugins = path.join(config, 'plugins');
     mkdirSync(plugins, { recursive: true });
     const configNodeModules = path.join(config, 'node_modules');
-    mkdirSync(configNodeModules, { recursive: true });
-    symlinkSync(
-      localPlugin.plugin,
-      path.join(configNodeModules, 'oh-my-opencode-slim'),
-    );
+    const linkPath = path.join(configNodeModules, ...PACKAGE_NAME.split('/'));
+    // A scoped package name needs its scope directory to exist first.
+    mkdirSync(path.dirname(linkPath), { recursive: true });
+    symlinkSync(localPlugin.plugin, linkPath);
     writeFileSync(
       path.join(config, 'package.json'),
       JSON.stringify({
         type: 'module',
-        dependencies: { 'oh-my-opencode-slim': `file:${localPlugin.plugin}` },
+        dependencies: { [PACKAGE_NAME]: `file:${localPlugin.plugin}` },
       }),
     );
     writeFileSync(
       path.join(plugins, 'load-plugin.js'),
-      "export { default } from 'oh-my-opencode-slim';\n",
+      `export { default } from '${PACKAGE_NAME}';\n`,
     );
     capture = await createCaptureServer(readPath);
     writeFileSync(

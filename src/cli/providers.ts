@@ -1,9 +1,11 @@
 import { DEFAULT_AGENT_MCPS } from '../config/agent-mcps';
+import { CONFIG_SCHEMA_URL } from '../config/package-identity';
 import { CUSTOM_SKILLS } from './custom-skills';
 import type { InstallConfig } from './types';
 
-const SCHEMA_URL =
-  'https://unpkg.com/oh-my-opencode-slim@latest/oh-my-opencode-slim.schema.json';
+// Must resolve to THIS package: the upstream schema does not describe the
+// fork-only config keys.
+const SCHEMA_URL = CONFIG_SCHEMA_URL;
 
 export const GENERATED_PRESETS = ['openai', 'opencode-go'] as const;
 

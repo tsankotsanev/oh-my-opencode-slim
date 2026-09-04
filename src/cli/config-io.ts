@@ -11,6 +11,12 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  matchesPluginSpecifier,
+  PACKAGE_NAME,
+  PACKAGE_NAME_ALIASES,
+  takePackageNameSegments,
+} from '../config/package-identity';
+import {
   INSTALLER_MANAGED_PLUGIN_OPTION,
   type PluginEntry,
 } from '../plugin-entry';
@@ -31,7 +37,6 @@ import type {
   OpenCodeConfig,
 } from './types';
 
-const PACKAGE_NAME = 'oh-my-opencode-slim';
 const DEFAULT_OPENCODE_AGENTS_TO_DISABLE = ['explore', 'general'] as const;
 
 function isString(value: unknown): value is string {
@@ -111,7 +116,10 @@ function isLocalPackageRootEntry(entry: string): boolean {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8')) as {
       name?: string;
     };
-    return packageJson.name === PACKAGE_NAME;
+    return (
+      packageJson.name !== undefined &&
+      PACKAGE_NAME_ALIASES.includes(packageJson.name)
+    );
   } catch {
     return false;
   }
@@ -119,14 +127,22 @@ function isLocalPackageRootEntry(entry: string): boolean {
 
 function isPackageManagerInstall(path: string): boolean {
   const normalizedPath = normalizePathForMatch(path);
-  return normalizedPath.includes(`/node_modules/${PACKAGE_NAME}`);
+  return PACKAGE_NAME_ALIASES.some((name) =>
+    normalizedPath.includes(`/node_modules/${name}`),
+  );
 }
 
+/**
+ * Detection is alias-tolerant (fork name OR the upstream name it replaces) so
+ * that installing/uninstalling removes a previous upstream entry instead of
+ * leaving the plugin registered twice. Entries are always WRITTEN under
+ * `PACKAGE_NAME`.
+ */
 function isPluginEntry(entry: string): boolean {
   return (
-    entry === PACKAGE_NAME ||
-    entry.startsWith(`${PACKAGE_NAME}@`) ||
-    (entry.startsWith('file://') && entry.includes(PACKAGE_NAME)) ||
+    matchesPluginSpecifier(entry) ||
+    (entry.startsWith('file://') &&
+      PACKAGE_NAME_ALIASES.some((name) => entry.includes(name))) ||
     isLocalPackageRootEntry(entry)
   );
 }
@@ -181,6 +197,8 @@ function getConfiguredExactVersion(): string | undefined {
     for (const entry of getPlugins(config)) {
       const spec = getPluginSpec(entry);
       if (!spec) continue;
+      // Canonical name only: a pin carried over from the upstream package
+      // would name a version that does not exist on this channel.
       if (spec === PACKAGE_NAME) {
         version = undefined;
       } else if (spec.startsWith(`${PACKAGE_NAME}@`)) {
@@ -199,9 +217,11 @@ function getRequestedPackageTag(packageRoot: string): string | undefined {
   const markerIndex = normalizedPath.lastIndexOf(marker);
   if (markerIndex === -1) return undefined;
 
-  const bunxSegment = normalizedPath
-    .slice(markerIndex + marker.length)
-    .split('/')[0];
+  // A scoped package name contains a '/', so the bunx directory that names it
+  // can span two path segments.
+  const bunxSegment = takePackageNameSegments(
+    normalizedPath.slice(markerIndex + marker.length),
+  );
   const packagePrefix = `${PACKAGE_NAME}@`;
   const packageIndex = bunxSegment.lastIndexOf(packagePrefix);
   if (packageIndex === -1) return undefined;

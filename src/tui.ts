@@ -9,6 +9,7 @@ import { createElement, insert, setProp } from '@opentui/solid';
 import { createSignal } from 'solid-js';
 import { DEFAULT_DISABLED_AGENTS, SUBAGENT_NAMES } from './config/constants';
 import { loadPluginConfig } from './config/loader';
+import { DISPLAY_NAME, STORAGE_NAMESPACE } from './config/package-identity';
 import {
   recordTmuxPane,
   removeTmuxPane,
@@ -21,7 +22,9 @@ import {
 } from './tui-state';
 import { isPluginDisabledByEnv } from './utils/env';
 
-const PLUGIN_NAME = 'oh-my-opencode-slim';
+// The OpenCode host plugin id — part of the storage/identity namespace, NOT
+// the npm package name. Must stay stable across the fork channel.
+const PLUGIN_NAME = STORAGE_NAMESPACE;
 const CONFIG_WARNING_COLOR = 'orange';
 const FALLBACK_SIDEBAR_AGENTS = SUBAGENT_NAMES.filter(
   (agent) =>
@@ -402,7 +405,7 @@ function renderSidebar(
                     theme.background,
                   ),
                 },
-                ['OMO-Slim'],
+                [DISPLAY_NAME],
               ),
             ],
           ),

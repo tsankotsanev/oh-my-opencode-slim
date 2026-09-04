@@ -14,14 +14,38 @@ interface PreparedPackageUpdate {
   targetDir: string;
 }
 
+/**
+ * Path segments in the package name: 1 for a bare name, 2 for a scoped one.
+ *
+ * OpenCode nests the plugin cache for a scoped package
+ * (`packages/@scope/name@version/node_modules/@scope/name`), so every walk
+ * between an install root and the package directory spans this many levels.
+ */
+const PACKAGE_NAME_PARTS = PACKAGE_NAME.split('/');
+
+/** Last segment of the package name — usable as a single path segment. */
+const PACKAGE_DIR_NAME = PACKAGE_NAME_PARTS[PACKAGE_NAME_PARTS.length - 1];
+
+/** Walks `levels` directories upward from `from`. */
+function ascend(from: string, levels: number): string {
+  let dir = from;
+  for (let index = 0; index < levels; index++) dir = path.dirname(dir);
+  return dir;
+}
+
 function getTargetInstallContext(
   installContext: AutoUpdateInstallContext,
   version: string,
 ): AutoUpdateInstallContext {
-  const installParent = path.dirname(installContext.installDir);
+  // `packages` sits directly above the install root for a bare name and one
+  // level higher for a scoped one.
+  const packagesDir = ascend(
+    installContext.installDir,
+    PACKAGE_NAME_PARTS.length,
+  );
   const parentDir =
-    path.basename(installParent) === 'packages'
-      ? installParent
+    path.basename(packagesDir) === 'packages'
+      ? packagesDir
       : path.join(CACHE_DIR, 'packages');
   const installDir = path.join(parentDir, `${PACKAGE_NAME}@${version}`);
   return { installDir, packageJsonPath: path.join(installDir, 'package.json') };
@@ -32,10 +56,19 @@ export function resolveInstallContext(
 ): AutoUpdateInstallContext | null {
   if (runtimePackageJsonPath) {
     const packageDir = path.dirname(runtimePackageJsonPath);
-    const nodeModulesDir = path.dirname(packageDir);
+
+    // Collect as many trailing segments as the package name has, so a scoped
+    // package's `@scope/name` directory pair is matched as a whole.
+    const observedParts: string[] = [];
+    let cursor = packageDir;
+    for (let index = 0; index < PACKAGE_NAME_PARTS.length; index++) {
+      observedParts.unshift(path.basename(cursor));
+      cursor = path.dirname(cursor);
+    }
+    const nodeModulesDir = cursor;
 
     if (
-      path.basename(packageDir) === PACKAGE_NAME &&
+      observedParts.join('/') === PACKAGE_NAME &&
       path.basename(nodeModulesDir) === 'node_modules'
     ) {
       const installDir = path.dirname(nodeModulesDir);
@@ -80,8 +113,10 @@ export function preparePackageUpdate(
     );
     const targetParent = path.dirname(targetContext.installDir);
     fs.mkdirSync(targetParent, { recursive: true });
+    // The staging prefix must be a single path segment: a scoped package name
+    // would otherwise ask mkdtemp for a nested directory that does not exist.
     stagingDir = fs.mkdtempSync(
-      path.join(targetParent, `.${PACKAGE_NAME}@${cacheIdentity}.staging-`),
+      path.join(targetParent, `.${PACKAGE_DIR_NAME}@${cacheIdentity}.staging-`),
     );
     fs.writeFileSync(
       path.join(stagingDir, 'package.json'),
@@ -141,6 +176,10 @@ export function publishPackageUpdate(
       discardPreparedPackageUpdate(prepared);
       return null;
     }
+    // A scoped package name adds a scope directory above the target; it may be
+    // absent if the cache was pruned between prepare and publish, and rename
+    // does not create parents.
+    fs.mkdirSync(path.dirname(prepared.targetDir), { recursive: true });
     fs.renameSync(prepared.stagingDir, prepared.targetDir);
     if (verifyInstalledPackage(prepared.targetDir, version)) {
       return prepared.targetDir;

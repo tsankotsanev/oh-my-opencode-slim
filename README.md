@@ -108,6 +108,35 @@ have Bun installed:
 npx oh-my-opencode-slim@latest install
 ```
 
+> Installing the **fork channel** instead? Use the scoped package — see
+> [Fork channel](#fork-channel) below.
+
+### Fork channel
+
+`@whitez/oh-my-opencode-slim` is a fork channel of this plugin: a
+different npm package, the same plugin. It adds background-lane control
+(`omos lanes list/show/stop/say/revive`), silence detection, and abort-cascade
+attribution on top of upstream 2.2.18.
+
+```bash
+bunx @whitez/oh-my-opencode-slim@latest install
+```
+
+Or register it directly in `opencode.json`:
+
+```json
+"plugin": ["@whitez/oh-my-opencode-slim@latest"]
+```
+
+Everything on disk keeps the upstream `oh-my-opencode-slim` namespace — config
+files, prompt overrides, storage, skills and project overrides are unchanged —
+so switching channels preserves an existing setup. Only the npm identity moves,
+which means an auto-update on this channel can never pull the upstream release
+over the fork. Installing also replaces an existing upstream `plugin` entry
+rather than registering the plugin twice.
+
+Release notes: [`docs/releases/2.3.0-fork.md`](docs/releases/2.3.0-fork.md).
+
 ### Run from Master
 
 Use this if you want the latest code, easier bug fixes, or a local setup for

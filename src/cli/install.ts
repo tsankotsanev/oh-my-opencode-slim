@@ -1,6 +1,11 @@
 import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
+import {
+  DISPLAY_NAME,
+  GITHUB_REPO,
+  GITHUB_URL,
+} from '../config/package-identity';
 import { syncBundledSkillsFromPackage } from '../hooks/auto-update-checker/skill-sync';
 import {
   detectBackgroundSubagentsTarget,
@@ -47,13 +52,10 @@ const SYMBOLS = {
   star: `${YELLOW}★${RESET}`,
 };
 
-const GITHUB_REPO = 'alvinunreal/oh-my-opencode-slim';
-const GITHUB_URL = `https://github.com/${GITHUB_REPO}`;
-
 function printHeader(isUpdate: boolean): void {
   console.log();
   console.log(
-    `${BOLD}oh-my-opencode-slim ${isUpdate ? 'Update' : 'Install'}${RESET}`,
+    `${BOLD}${DISPLAY_NAME} ${isUpdate ? 'Update' : 'Install'}${RESET}`,
   );
   console.log('='.repeat(30));
   console.log();
@@ -554,9 +556,7 @@ async function runInstall(config: InstallConfig): Promise<number> {
   console.log(`${modelsInfo}`);
   const altProviders = 'For the full configuration reference, see:';
   console.log(altProviders);
-  const docsUrl =
-    'https://github.com/alvinunreal/oh-my-opencode-slim/' +
-    'blob/master/docs/configuration.md';
+  const docsUrl = `${GITHUB_URL}/blob/master/docs/configuration.md`;
   console.log(`  ${BLUE}${docsUrl}${RESET}`);
   console.log();
 

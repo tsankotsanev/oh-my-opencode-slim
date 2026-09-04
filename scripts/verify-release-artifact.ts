@@ -16,6 +16,16 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distDir = path.join(repoRoot, 'dist');
 
+// The npm package name (scoped on the fork channel) drives module resolution
+// and node_modules layout; the plugin id reported to the OpenCode host is a
+// separate, deliberately stable namespace. Do not merge the two.
+const packageName = (
+  JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8')) as {
+    name: string;
+  }
+).name;
+const PLUGIN_ID = 'oh-my-opencode-slim';
+
 const suspiciousPathPatterns = [
   /\/Users\/[^\s'"`]+(?:node_modules|oh-my-opencode-slim)[^\s'"`]*/,
   /\/home\/[^\s'"`]+(?:node_modules|oh-my-opencode-slim)[^\s'"`]*/,
@@ -181,7 +191,7 @@ function verifyFreshInstall(tarballPath: string) {
     const installedEntry = path.join(
       installDir,
       'node_modules',
-      'oh-my-opencode-slim',
+      ...packageName.split('/'),
       'dist',
       'index.js',
     );
@@ -196,8 +206,8 @@ function verifyFreshInstall(tarballPath: string) {
     }
 
     const smokeScript = [
-      "import pkg from 'oh-my-opencode-slim';",
-      "if (pkg?.id !== 'oh-my-opencode-slim') throw new Error('default export has an unexpected plugin id');",
+      `import pkg from '${packageName}';`,
+      `if (pkg?.id !== '${PLUGIN_ID}') throw new Error('default export has an unexpected plugin id');`,
       "if (typeof pkg.server !== 'function') throw new Error('default export is missing a server plugin factory');",
       "if (typeof pkg.setup !== 'function') throw new Error('default export is missing a v2 setup factory');",
       "console.log('package loads');",
@@ -209,8 +219,8 @@ function verifyFreshInstall(tarballPath: string) {
     });
 
     const tuiSmokeScript = [
-      "import pkg from 'oh-my-opencode-slim/tui';",
-      "if (pkg?.id !== 'oh-my-opencode-slim:tui') throw new Error('TUI export has an unexpected plugin id');",
+      `import pkg from '${packageName}/tui';`,
+      `if (pkg?.id !== '${PLUGIN_ID}:tui') throw new Error('TUI export has an unexpected plugin id');`,
       "if (typeof pkg.tui !== 'function') throw new Error('TUI export is missing its v1 factory');",
       "if (typeof pkg.setup !== 'function') throw new Error('TUI export is missing its v2 setup factory');",
       "console.log('TUI package loads');",
@@ -222,8 +232,8 @@ function verifyFreshInstall(tarballPath: string) {
     // v2 hosts install this package with `subpaths: ["server", ""]`; the
     // exports map must resolve ./server to the self-contained bundle.
     const serverSmokeScript = [
-      "import pkg from 'oh-my-opencode-slim/server';",
-      "if (pkg?.id !== 'oh-my-opencode-slim') throw new Error('server export has an unexpected plugin id');",
+      `import pkg from '${packageName}/server';`,
+      `if (pkg?.id !== '${PLUGIN_ID}') throw new Error('server export has an unexpected plugin id');`,
       "if (typeof pkg.server !== 'function') throw new Error('server export is missing a v1 plugin factory');",
       "if (typeof pkg.setup !== 'function') throw new Error('server export is missing a v2 setup factory');",
       "console.log('server package loads');",

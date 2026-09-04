@@ -268,7 +268,7 @@ export function formatJsonDoctorResult(result: DoctorResult): string {
 
 export async function doctor(args: DoctorArgs): Promise<number> {
   if (args.help) {
-    console.log(`Usage: oh-my-opencode-slim doctor [OPTIONS]
+    console.log(`Usage: omos doctor [OPTIONS]
 
 Options:
   --json              Print diagnostics as JSON
