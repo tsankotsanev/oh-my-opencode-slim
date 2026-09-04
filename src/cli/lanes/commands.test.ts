@@ -157,6 +157,7 @@ function seedLanes(lanes: LaneSeed[] = [{}], directory = projectDir): void {
       board.markCascade(taskID, {
         parentSessionID: lane.parentSessionID ?? 'ses_parent',
         at: lane.cascadeAt,
+        cause: 'esc',
       });
     }
     if (lane.cancelledByUser) {
@@ -1252,6 +1253,7 @@ describe('omos lanes revive', () => {
     board.markCascade('ses_child1', {
       parentSessionID: 'ses_parent',
       at: NOW - 10_000,
+      cause: 'esc',
     });
     board.markReconciled('ses_child1');
     createLaneMirror({
@@ -1307,13 +1309,15 @@ describe('omos lanes revive', () => {
     ]);
   });
 
-  test('--cascade says so when nothing is attributed to an ESC', async () => {
+  test('--cascade says so when nothing is attributed to an abort', async () => {
     seedLanes([{ state: 'error' }]);
     seedSidecar();
 
     const result = await run(['revive', '--cascade']);
     expect(result.code).toBe(0);
-    expect(result.stdout()).toContain('none is attributed to an ESC cascade');
+    expect(result.stdout()).toContain(
+      'none is attributed to an orchestrator abort',
+    );
     expect(result.calls.promptAsync).toHaveLength(0);
   });
 

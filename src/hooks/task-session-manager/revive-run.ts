@@ -50,6 +50,23 @@ import { getClient } from '../../utils/opencode-client';
 import { withAgent } from '../../utils/prompt-agent';
 import type { RevivedRunTracker } from './revived-run-tracker';
 
+/**
+ * Something else is mid-operation on this session, so the relaunch was not
+ * even attempted.
+ *
+ * A type rather than a message, because callers have to distinguish it: it is
+ * the one relaunch failure that is purely transient (a cancel or a second
+ * revive holding the lease) and therefore worth retrying, and `task_revive`
+ * renders it differently. Matching on the string was one rename away from
+ * silently reclassifying it as a hard failure.
+ */
+export class RelaunchLeaseUnavailableError extends Error {
+  constructor() {
+    super('relaunch lease unavailable');
+    this.name = 'RelaunchLeaseUnavailableError';
+  }
+}
+
 export interface RetainedRunDeps {
   input: PluginInput;
   backgroundJobBoard: BackgroundJobStore;
@@ -95,7 +112,7 @@ export async function launchRetainedRun(
     record.generation,
   );
   if (!relaunchLease) {
-    throw new Error('relaunch lease unavailable');
+    throw new RelaunchLeaseUnavailableError();
   }
 
   let launched: BackgroundJobRecord | undefined;

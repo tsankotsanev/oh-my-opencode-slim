@@ -46,8 +46,10 @@ import {
 } from './board-injection';
 import {
   type CascadeTracker,
+  claimCascadeTracker,
   createCascadeTracker,
   type ReviveOnCascadeMode,
+  releaseCascadeTracker,
 } from './cascade-attribution';
 import { handleEvent } from './event-router';
 import { createIdleReconciler } from './idle-reconciliation';
@@ -533,10 +535,27 @@ export function createTaskSessionManagerHook(
               adopted: adopted !== undefined,
             });
           } catch (error) {
-            log('[task-session-manager] user revive adoption failed', {
-              sessionID,
-              error: error instanceof Error ? error.message : String(error),
-            });
+            // WARNING, not a note: the intent has already been CLAIMED by the
+            // caller, so this is the only record that a run the user started
+            // is now unsupervised. The session is genuinely running (the CLI
+            // prompted it and got a 204) but no generation was registered, so
+            // the board keeps showing the lane as interrupted and the parent
+            // will never be told how the run ended.
+            //
+            // The intent is deliberately NOT re-appended: the next busy signal
+            // would adopt a run that is already mid-turn, and `launchRetainedRun`
+            // has by then left the record `statusUncertain` — replaying that is
+            // a worse outcome than an unsupervised lane the board still lists.
+            log(
+              '[task-session-manager] WARNING: user revive adoption failed; run is live but unsupervised',
+              {
+                sessionID,
+                error: error instanceof Error ? error.message : String(error),
+                consequence:
+                  'no generation registered: the board keeps this lane as interrupted and the parent gets no terminal notification',
+                remedy: `check \`omos lanes show\`; ask the orchestrator for task_revive once the session is idle again`,
+              },
+            );
           }
           laneMirror.scheduleFlush();
         }
@@ -583,16 +602,25 @@ export function createTaskSessionManagerHook(
   const disposeLaneWriters = (): void => {
     laneMirror.dispose();
     laneServerSidecar.dispose();
-    // The cascade tracker belongs to this generation too, and for a sharper
-    // reason than the writers: the factory re-runs on every CONFIG update, so
-    // a pending auto-revive scheduled under `reviveOnCascade: 'auto'` would
-    // otherwise still fire after the user had just switched it to `'off'`.
-    // Dropping the pending restart is the direction the default already
-    // points in, and the newer generation owns detection from here on.
-    cascadeTracker.dispose();
     releaseLaneWriters(_ctx.directory, disposeLaneWriters);
   };
   if (laneControlEnabled) claimLaneWriters(_ctx.directory, disposeLaneWriters);
+
+  /**
+   * Tear down this generation's cascade tracker.
+   *
+   * Claimed UNCONDITIONALLY, unlike the lane writers: attribution and
+   * auto-revive run whether or not `backgroundJobs.laneControl` is on, and the
+   * factory re-runs on every CONFIG update. A restart still pending under
+   * `reviveOnCascade: 'auto'` must not fire after the user has just switched
+   * it to `'off'`, and gating that teardown on an unrelated feature flag is
+   * how it would.
+   */
+  const disposeCascadeTracker = (): void => {
+    cascadeTracker.dispose();
+    releaseCascadeTracker(_ctx.directory, disposeCascadeTracker);
+  };
+  claimCascadeTracker(_ctx.directory, disposeCascadeTracker);
 
   return {
     markRevivedRunPending: (taskID: string): void => {
@@ -799,7 +827,7 @@ export function createTaskSessionManagerHook(
 
       if (input.event.type === 'server.instance.disposed') {
         runtimeStatusReconciler.dispose();
-        cascadeTracker.dispose();
+        disposeCascadeTracker();
         // Flush last, then drop the sidecar: a missing sidecar makes the CLI
         // say "start OpenCode or pass --server", whereas a stale one would
         // send it at a dead (or recycled) port.

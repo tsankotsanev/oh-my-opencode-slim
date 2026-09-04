@@ -209,7 +209,9 @@ describe('parseLanesArgs', () => {
       'not a source of truth',
       'task_revive',
       'revive --cascade',
-      'ESC on the orchestrator aborts every lane it owns',
+      'An abort of the orchestrator kills every lane it owns',
+      // The failover half of the hazard must be discoverable from --help too.
+      "this plugin's own rate-limit failover",
     ]) {
       expect(LANES_HELP).toContain(fragment);
     }

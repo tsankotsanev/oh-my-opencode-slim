@@ -104,7 +104,7 @@ describe('cascade detection', () => {
     h.tracker.noteOrchestratorBusy(PARENT);
     h.tracker.noteChildAbort('child-1', PARENT);
     h.advance(100);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
 
     expect(h.cascadeAt('child-1')).toBeDefined();
     expect(h.board.get('child-1')?.killedByCascade?.parentSessionID).toBe(
@@ -118,7 +118,7 @@ describe('cascade detection', () => {
     const h = harness();
     h.abortedLane('child-1');
     h.abortedLane('child-2');
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
     h.advance(200);
     h.tracker.noteChildAbort('child-1', PARENT);
     h.advance(200);
@@ -215,7 +215,7 @@ describe('cascade detection', () => {
     h.advance(1_000);
     h.tracker.noteChildAbort('child-1', PARENT);
     h.advance(CASCADE_WINDOW_MS + 1);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
 
     expect(h.cascadeAt('child-1')).toBeUndefined();
   });
@@ -228,7 +228,7 @@ describe('cascade detection', () => {
     h.abortedLane('child-1');
     h.board.markCancelled('child-1', 'superseded', h.now(), { force: true });
     h.tracker.noteChildAbort('child-1', PARENT);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
 
     expect(h.cascadeAt('child-1')).toBeUndefined();
   });
@@ -243,7 +243,7 @@ describe('cascade detection', () => {
     h.abortedLane('child-2');
     h.tracker.noteChildAbort('child-1', PARENT);
     h.tracker.noteChildAbort('child-2', PARENT);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
     expect(h.cascadeAt('child-1')).toBeDefined();
 
     h.board.markCancelled('child-1', 'superseded', h.now(), { force: true });
@@ -256,7 +256,7 @@ describe('cascade detection', () => {
     h.abortedLane('child-1');
     h.board.markCancelledByUser('child-1', 'wrong file set');
     h.tracker.noteChildAbort('child-1', PARENT);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
 
     expect(h.cascadeAt('child-1')).toBeUndefined();
   });
@@ -265,10 +265,10 @@ describe('cascade detection', () => {
     const h = harness();
     h.abortedLane('child-1');
     h.tracker.noteChildAbort('child-1', PARENT);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
     const first = h.cascadeAt('child-1');
     h.advance(10_000);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
     h.tracker.noteChildAbort('child-1', PARENT);
 
     expect(h.cascadeAt('child-1')).toBe(first as number);
@@ -289,7 +289,7 @@ describe('auto-revive (reviveOnCascade: auto)', () => {
       h.abortedLane(taskID);
       h.tracker.noteChildAbort(taskID, PARENT);
     }
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
   }
 
   test('off (the default) attributes but never restarts anything', async () => {
@@ -362,7 +362,7 @@ describe('auto-revive (reviveOnCascade: auto)', () => {
     // Every lane is already dead, so the second press produces a cascade with
     // zero candidates — which is exactly what "no, stay stopped" looks like.
     h.advance(CASCADE_WINDOW_MS + 1);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
 
     await h.tracker.flushAutoRevive();
     expect(h.revived).toEqual([]);
@@ -372,7 +372,7 @@ describe('auto-revive (reviveOnCascade: auto)', () => {
     const h = autoHarness();
     cascade(h, ['child-1']);
     h.advance(100);
-    h.tracker.noteOrchestratorAbort(PARENT);
+    h.tracker.noteOrchestratorAbort(PARENT, 'esc');
 
     await h.tracker.flushAutoRevive();
     expect(h.revived).toEqual(['child-1']);
@@ -415,6 +415,36 @@ describe('auto-revive (reviveOnCascade: auto)', () => {
     await h.tracker.flushAutoRevive();
 
     expect(h.revived).toEqual(['child-2']);
+  });
+
+  /**
+   * `reconciled` means "the orchestrator has been told", not a different fate.
+   * A user who types a new message right after the interruption gets the board
+   * injected, which flips every lane of the cascade to `reconciled` inside the
+   * 13s window - and a literal `state === 'error'` test would then find
+   * nothing to restart, silently. The stamp survives `markReconciled`, so the
+   * outcome is read through it exactly as `omos lanes revive` does.
+   */
+  test('a lane the parent already acknowledged is still restarted', async () => {
+    const h = autoHarness();
+    cascade(h, ['child-1']);
+    h.board.markReconciled('child-1');
+    expect(h.board.get('child-1')?.state).toBe('reconciled');
+    expect(h.board.get('child-1')?.killedByCascade).toBeDefined();
+
+    await h.tracker.flushAutoRevive();
+
+    expect(h.revived).toEqual(['child-1']);
+  });
+
+  test('an acknowledged lane the user stopped is still left alone', async () => {
+    const h = autoHarness();
+    cascade(h, ['child-1']);
+    h.board.markCancelledByUser('child-1', 'I meant it');
+    h.board.markReconciled('child-1');
+    await h.tracker.flushAutoRevive();
+
+    expect(h.revived).toEqual([]);
   });
 
   test('a failing restart is logged, not retried, and still counts', async () => {

@@ -1991,11 +1991,13 @@ describe('ESC cascade labels', () => {
     const after = board.markCascade('ses_1', {
       parentSessionID: 'parent-1',
       at: 5_000,
+      cause: 'esc',
     });
 
     expect(after?.killedByCascade).toEqual({
       parentSessionID: 'parent-1',
       at: 5_000,
+      cause: 'esc',
     });
     expect(after?.state).toBe('error');
     expect(after?.resultSummary).toBe(before?.resultSummary);
@@ -2011,8 +2013,11 @@ describe('ESC cascade labels', () => {
       now: 1_000,
     });
     expect(
-      running.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 })
-        ?.killedByCascade,
+      running.markCascade('ses_1', {
+        parentSessionID: 'parent-1',
+        at: 5_000,
+        cause: 'esc',
+      })?.killedByCascade,
     ).toBeUndefined();
 
     const userStopped = killedByEsc();
@@ -2021,6 +2026,7 @@ describe('ESC cascade labels', () => {
       userStopped.markCascade('ses_1', {
         parentSessionID: 'parent-1',
         at: 5_000,
+        cause: 'esc',
       })?.killedByCascade,
     ).toBeUndefined();
 
@@ -2033,36 +2039,55 @@ describe('ESC cascade labels', () => {
       now: 2_500,
     });
     expect(
-      uncertain.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 })
-        ?.killedByCascade,
+      uncertain.markCascade('ses_1', {
+        parentSessionID: 'parent-1',
+        at: 5_000,
+        cause: 'esc',
+      })?.killedByCascade,
     ).toBeUndefined();
 
     const cancelled = killedByEsc();
     cancelled.markCancelled('ses_1', 'superseded', 3_000, { force: true });
     expect(
-      cancelled.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 })
-        ?.killedByCascade,
+      cancelled.markCascade('ses_1', {
+        parentSessionID: 'parent-1',
+        at: 5_000,
+        cause: 'esc',
+      })?.killedByCascade,
     ).toBeUndefined();
 
     expect(
       killedByEsc().markCascade('ses_missing', {
         parentSessionID: 'parent-1',
         at: 5_000,
+        cause: 'esc',
       }),
     ).toBeUndefined();
   });
 
   test('a second stamp keeps the first instant, so a group cannot split', () => {
     const board = killedByEsc();
-    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
-    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 9_000 });
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'esc',
+    });
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 9_000,
+      cause: 'esc',
+    });
 
     expect(board.get('ses_1')?.killedByCascade?.at).toBe(5_000);
   });
 
   test('relaunching clears both labels but never the auto-revive cooldown', () => {
     const board = killedByEsc();
-    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'esc',
+    });
     board.markAutoRevived('ses_1', 5_500);
 
     const lease = board.acquireRelaunchLease(
@@ -2100,39 +2125,78 @@ describe('ESC cascade labels', () => {
       now: 1_000,
     });
     board.updateStatus({ taskID: 'ses_2', state: 'error', now: 2_000 });
-    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
-    board.markCascade('ses_2', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'esc',
+    });
+    board.markCascade('ses_2', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'esc',
+    });
 
     const rendered = board.formatForPrompt('parent-1') ?? '';
     expect(rendered).toContain(
-      'Action: interrupted by ESC on the orchestrator; session intact - resume via task_revive or `omos lanes revive fix-1`',
+      'Action: interrupted by an abort of the orchestrator (ESC); session intact - resume via task_revive or `omos lanes revive fix-1`',
     );
     expect(rendered).toContain(
-      '2 lanes were interrupted together by one ESC on the orchestrator (fix-1, exp-1)',
+      'fix-1, exp-1 share ONE abort of the orchestrator (ESC): resume the whole group with `omos lanes revive --cascade`.',
     );
-    expect(rendered).toContain('omos lanes revive --cascade');
+
+    // The group line says ONLY what the per-lane Actions cannot. "Session
+    // intact" and task_revive live on every member's own line, so one copy
+    // per lane and no more.
+    expect(rendered.match(/session intact/g)).toHaveLength(2);
+    expect(rendered.match(/interrupted by an abort/g)).toHaveLength(2);
 
     // Render-pure: two renders of an unchanged board are byte-identical.
     expect(board.formatForPrompt('parent-1')).toBe(rendered);
   });
 
-  test('a single-lane cascade gets its Action but no group summary', () => {
+  test('a model failover is attributed as itself, not as a keypress', () => {
+    // Foreground fallback aborts the orchestrator to re-prompt it on a
+    // fallback model, and takes every lane with it. Telling the orchestrator
+    // the user pressed ESC would be a lie about the plugin's own recovery.
     const board = killedByEsc();
-    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'fallback',
+    });
 
     const rendered = board.formatForPrompt('parent-1') ?? '';
-    expect(rendered).toContain('Interrupted by: ESC on the orchestrator');
-    expect(rendered).not.toContain('were interrupted together');
+    expect(rendered).toContain(
+      'interrupted by an abort of the orchestrator (model failover)',
+    );
+    expect(rendered).not.toContain('(ESC)');
+  });
+
+  test('a single-lane cascade gets its Action but no group summary', () => {
+    const board = killedByEsc();
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'esc',
+    });
+
+    const rendered = board.formatForPrompt('parent-1') ?? '';
+    expect(rendered).toContain('interrupted by an abort of the orchestrator');
+    expect(rendered).not.toContain('share ONE abort');
   });
 
   test('a user stop outranks the cascade Action', () => {
     const board = killedByEsc();
-    board.markCascade('ses_1', { parentSessionID: 'parent-1', at: 5_000 });
+    board.markCascade('ses_1', {
+      parentSessionID: 'parent-1',
+      at: 5_000,
+      cause: 'esc',
+    });
     board.markCancelledByUser('ses_1', 'wrong file set');
 
     const rendered = board.formatForPrompt('parent-1') ?? '';
     expect(rendered).toContain('Stopped by: the user');
-    expect(rendered).not.toContain('Interrupted by: ESC');
+    expect(rendered).not.toContain('interrupted by an abort');
     // The stamp itself survives - it is still true - it just does not render.
     expect(board.get('ses_1')?.killedByCascade).toBeDefined();
   });

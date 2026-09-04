@@ -322,7 +322,14 @@ describe('revived run tracker', () => {
     expect(text).not.toContain('Background task failed');
   });
 
-  test('renders a cascade lane as an interruption, with the recovery', async () => {
+  /**
+   * One abort produces N of these, and every one of them would be a turn.
+   * The board renders the same fact as a per-lane Action plus ONE group line,
+   * injected into a turn the orchestrator was taking anyway - so the prompt is
+   * the expensive way to say something already said for free, and under
+   * `reviveOnCascade: 'auto'` it would announce a failure about to be undone.
+   */
+  test('sends NO prompt for a cascade lane: the board carries it', async () => {
     const text = await notifyAbortedRun((board) => {
       board.updateStatus({
         taskID: 'ses_child',
@@ -332,14 +339,32 @@ describe('revived run tracker', () => {
       board.markCascade('ses_child', {
         parentSessionID: 'parent',
         at: 5_000,
+        cause: 'esc',
       });
     });
 
-    expect(text).toContain(
-      'Background task interrupted by ESC on the orchestrator: inspect the change',
-    );
-    expect(text).toContain('task_revive(task_id) resumes it in place');
-    expect(text).not.toContain('Background task failed');
+    expect(text).toBe('');
+  });
+
+  test('a user stop still prompts even when a cascade stamp is present', async () => {
+    // The stop is a DECISION; it outranks the cascade label everywhere else on
+    // the board too, and the orchestrator must not sit on it until its next
+    // turn.
+    const text = await notifyAbortedRun((board) => {
+      board.updateStatus({
+        taskID: 'ses_child',
+        state: 'error',
+        resultSummary: 'Aborted',
+      });
+      board.markCascade('ses_child', {
+        parentSessionID: 'parent',
+        at: 5_000,
+        cause: 'esc',
+      });
+      board.markCancelledByUser('ses_child', 'wrong file set');
+    });
+
+    expect(text).toContain('Background task stopped by the user');
   });
 
   test('an unlabelled failure still reads as a failure', async () => {

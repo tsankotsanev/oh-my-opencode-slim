@@ -210,5 +210,5 @@ omos lanes revive <alias|ses_id> | --cascade | --all
 - `list` reads only the mirror; every other command re-checks the live server first
 - `stop` writes its intent BEFORE aborting (the plugin claims it to label the record as the user's cancellation), then verifies the session went idle
 - `say` always carries the lane's own agent; `--force` never waives that
-- `revive` resumes a lane in its own session, agent AND model pinned, and writes a `revive` intent BEFORE prompting so the plugin can register the run with the revived-run tracker; `--cascade` undoes the last ESC on the orchestrator (which aborts every lane it owns)
-- Refusal table, the ESC attribution rules and the multi-server caveat: `docs/background-orchestration.md#controlling-lanes-from-a-second-terminal` and `#esc-and-recovery`
+- `revive` resumes a lane in its own session, agent AND model pinned, and writes a `revive` intent BEFORE prompting so the plugin can register the run with the revived-run tracker; `--cascade` undoes the last abort of the orchestrator (ESC, or the plugin's own rate-limit failover — either one aborts every lane it owns)
+- Refusal table, the cascade attribution rules and the multi-server caveat: `docs/background-orchestration.md#controlling-lanes-from-a-second-terminal` and `#esc-failover-and-recovery`

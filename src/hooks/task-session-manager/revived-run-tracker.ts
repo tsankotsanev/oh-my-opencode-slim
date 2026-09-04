@@ -6,6 +6,7 @@ import type {
 } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
 import type { BackgroundJobSupervisor } from '../../utils/background-job-supervisor';
+import { log } from '../../utils/logger';
 import { getClient } from '../../utils/opencode-client';
 import { sessionErrorMessage } from '../../utils/session-error';
 import { COMPLETED_WITHOUT_TEXT_DIAGNOSTIC } from '../../utils/task';
@@ -42,6 +43,14 @@ type RevivedRun = {
     sent: boolean;
     pending: boolean;
     retryTimer?: ReturnType<typeof setTimeout>;
+    /**
+     * Earliest instant this run's parent notification may go on the wire.
+     *
+     * See {@link RevivedRunTracker.holdNotification} — an abort's CAUSE is not
+     * knowable at the moment the abort lands, so the send waits for it.
+     */
+    holdUntil?: number;
+    deferTimer?: ReturnType<typeof setTimeout>;
   };
   stabilizationProbes: number;
   stabilizationTimer?: ReturnType<typeof setTimeout>;
@@ -60,7 +69,21 @@ export interface RevivedRunTracker {
   }): void;
   isTracked(taskID: string, generation: number): boolean;
   probe(taskID: string, generation: number): Promise<boolean>;
-  onTerminal(record: BackgroundJobRecord): void;
+  onTerminal(record: BackgroundJobRecord, options?: { deferMs?: number }): void;
+  /**
+   * Hold this run's parent notification for `deferMs`, BEFORE the terminal
+   * record exists.
+   *
+   * The reason this is a separate call and not just `onTerminal`'s option: the
+   * board publishes every terminal transition to its own outcome listeners
+   * (`src/index.ts` registers `onTerminal` as one), and that publication
+   * happens SYNCHRONOUSLY inside `updateStatus`. By the time the event router
+   * reaches its own `onTerminal(record, { deferMs })` call the prompt would
+   * already be on the wire. So the router arms the hold first and the option
+   * is only a second line of defence — relying on the two call paths landing
+   * in a particular order is exactly the ordering bug this fixes.
+   */
+  holdNotification(taskID: string, deferMs: number): void;
   dispose(): void;
 }
 
@@ -76,8 +99,15 @@ export function createRevivedRunTracker(options: {
   onSettled?: (taskID: string) => void;
   contextFilesForPrompt?: (taskID: string) => ContextFile[];
   pruneContext?: () => void;
+  /** Test seams; default to the globals, so behaviour is unchanged. */
+  now?: () => number;
+  setTimeoutFn?: typeof setTimeout;
+  clearTimeoutFn?: typeof clearTimeout;
 }): RevivedRunTracker {
   const runs = new Map<string, RevivedRun>();
+  const now = options.now ?? (() => Date.now());
+  const startTimer = options.setTimeoutFn ?? setTimeout;
+  const clearTimer = options.clearTimeoutFn ?? clearTimeout;
   const maxNotificationRetries =
     options.maxNotificationRetries ?? DEFAULT_NOTIFICATION_RETRIES;
   const retryDelayMs =
@@ -127,9 +157,15 @@ export function createRevivedRunTracker(options: {
     return run.probeInFlight;
   };
 
-  const onTerminal = (record: BackgroundJobRecord): void => {
+  const onTerminal = (
+    record: BackgroundJobRecord,
+    options_?: { deferMs?: number },
+  ): void => {
     const run = runs.get(record.taskID);
     if (!run || run.generation !== record.generation) return;
+    if (options_?.deferMs !== undefined) {
+      holdNotification(record.taskID, options_.deferMs);
+    }
     if (record.state === 'cancelled') {
       settleRun(run, record);
       options.backgroundJobSupervisor?.onTerminal(record);
@@ -142,11 +178,34 @@ export function createRevivedRunTracker(options: {
     finish(run, record);
   };
 
+  const holdNotification = (taskID: string, deferMs: number): void => {
+    const run = runs.get(taskID);
+    if (!run || disposed || deferMs <= 0) return;
+    // Never shortens an existing hold: two aborts landing on one lane must not
+    // let the second one race the cause of the first onto the wire.
+    const until = now() + deferMs;
+    if (run.notification.holdUntil !== undefined) {
+      if (until <= run.notification.holdUntil) return;
+    }
+    run.notification.holdUntil = until;
+    // A send already scheduled under a shorter hold is re-armed, which is what
+    // makes the router's `onTerminal(..., { deferMs })` still work when the
+    // board's synchronous outcome listener got there first.
+    if (run.notification.deferTimer) {
+      clearTimeout(run.notification.deferTimer);
+      run.notification.deferTimer = undefined;
+      scheduleDeferredNotification(run);
+    }
+  };
+
   const dispose = (): void => {
     disposed = true;
     for (const run of runs.values()) {
       if (run.notification.retryTimer) {
         clearTimeout(run.notification.retryTimer);
+      }
+      if (run.notification.deferTimer) {
+        clearTimeout(run.notification.deferTimer);
       }
       if (run.stabilizationTimer) {
         clearTimeout(run.stabilizationTimer);
@@ -245,16 +304,42 @@ export function createRevivedRunTracker(options: {
   function finish(run: RevivedRun, record: BackgroundJobRecord): boolean {
     if (record.state !== 'completed' && record.state !== 'error') return false;
     if (run.stabilizationTimer) {
-      clearTimeout(run.stabilizationTimer);
+      clearTimer(run.stabilizationTimer);
       run.stabilizationTimer = undefined;
     }
     if (run.terminalState && run.terminalState !== record.state) return true;
     run.terminalState = record.state;
+    // Everything except the notification settles NOW: the context files, the
+    // supervisor and the board are all local, and only the parent prompt has
+    // to wait for the cause of an abort to be established.
     settleRun(run, record);
     options.backgroundJobSupervisor?.onTerminal(record);
     if (run.notification.sent || run.notification.pending) return true;
-    void notifyParent(run, record);
+    if (run.notification.deferTimer) return true;
+    const delay = Math.max(0, (run.notification.holdUntil ?? 0) - now());
+    if (delay > 0) {
+      scheduleDeferredNotification(run);
+      return true;
+    }
+    void notifyParent(run);
     return true;
+  }
+
+  /**
+   * Wait out the hold, then decide from the record as it stands THEN.
+   *
+   * The delay is recomputed on every (re-)arm rather than captured, so a hold
+   * extended after the timer was set lands at the later instant.
+   */
+  function scheduleDeferredNotification(run: RevivedRun): void {
+    if (disposed || runs.get(run.taskID) !== run) return;
+    if (run.notification.deferTimer) return;
+    const delay = Math.max(0, (run.notification.holdUntil ?? 0) - now());
+    run.notification.deferTimer = startTimer(() => {
+      run.notification.deferTimer = undefined;
+      void notifyParent(run);
+    }, delay);
+    run.notification.deferTimer?.unref?.();
   }
 
   function settleRun(run: RevivedRun, record: BackgroundJobRecord): void {
@@ -267,10 +352,15 @@ export function createRevivedRunTracker(options: {
     options.onSettled?.(run.taskID);
   }
 
-  async function notifyParent(
-    run: RevivedRun,
-    record: BackgroundJobRecord,
-  ): Promise<void> {
+  /**
+   * Tell the parent how this run ended — reading the record as it stands NOW.
+   *
+   * Never from the record captured at `finish` time: on an abort that record
+   * predates the evidence of what caused it by ~100ms (probes B1/B3), so a
+   * captured render is guaranteed to say "failed" for every lane one ESC (or
+   * one model failover) killed.
+   */
+  async function notifyParent(run: RevivedRun): Promise<void> {
     if (disposed || run.notification.sent || run.notification.pending) return;
     run.notification.pending = true;
     run.notification.attempts += 1;
@@ -287,9 +377,29 @@ export function createRevivedRunTracker(options: {
       if (
         !current ||
         current.generation !== run.generation ||
-        terminalOutcome(current) !== run.terminalState ||
-        record.state !== run.terminalState
+        terminalOutcome(current) !== run.terminalState
       ) {
+        discardRun(run);
+        return;
+      }
+      // A cascade is ONE event with ONE recovery, and the board already
+      // renders it that way: a per-lane Action plus a single group line, both
+      // injected into a turn the orchestrator was going to take anyway. Waking
+      // it N times to say "N of your lanes were interrupted, each intact" is
+      // the cost this whole label exists to avoid — and under
+      // `reviveOnCascade: 'auto'` it would announce a failure the plugin is
+      // about to undo. A deliberate user stop still prompts: that one is a
+      // decision the orchestrator must not sit on.
+      if (current.killedByCascade && current.cancelledByUser === undefined) {
+        log(
+          '[revived-run-tracker] cascade lane: no parent prompt (the board carries it)',
+          {
+            taskID: run.taskID,
+            alias: current.alias,
+            cause: current.killedByCascade.cause,
+            parentSessionID: run.parentSessionID,
+          },
+        );
         discardRun(run);
         return;
       }
@@ -298,16 +408,16 @@ export function createRevivedRunTracker(options: {
         run.generation,
       );
       if (!lease) {
-        scheduleNotificationRetry(run, record);
+        scheduleNotificationRetry(run);
         return;
       }
-      const state = record.state === 'completed' ? 'completed' : 'error';
+      const state = run.terminalState === 'completed' ? 'completed' : 'error';
       const tag = state === 'completed' ? 'task_result' : 'task_error';
       const text = [
         `<task id="${run.taskID}" state="${state}">`,
-        `<summary>${terminalSummary(run.description, record, state)}</summary>`,
+        `<summary>${terminalSummary(run.description, current, state)}</summary>`,
         `<${tag}>`,
-        ...terminalBody(record, state),
+        ...terminalBody(current, state),
         `</${tag}>`,
         '</task>',
       ].join('\n');
@@ -337,16 +447,13 @@ export function createRevivedRunTracker(options: {
       }
       run.notification.sent = true;
     } catch {
-      scheduleNotificationRetry(run, record);
+      scheduleNotificationRetry(run);
     } finally {
       run.notification.pending = false;
     }
   }
 
-  function scheduleNotificationRetry(
-    run: RevivedRun,
-    record: BackgroundJobRecord,
-  ): void {
+  function scheduleNotificationRetry(run: RevivedRun): void {
     if (
       disposed ||
       runs.get(run.taskID) !== run ||
@@ -355,22 +462,22 @@ export function createRevivedRunTracker(options: {
     ) {
       return;
     }
-    run.notification.retryTimer = setTimeout(() => {
+    run.notification.retryTimer = startTimer(() => {
       run.notification.retryTimer = undefined;
-      void notifyParent(run, record);
+      void notifyParent(run);
     }, retryDelayMs);
-    run.notification.retryTimer.unref?.();
+    run.notification.retryTimer?.unref?.();
   }
 
   function scheduleStabilizationProbe(run: RevivedRun): void {
     if (disposed || runs.get(run.taskID) !== run || run.stabilizationTimer) {
       return;
     }
-    run.stabilizationTimer = setTimeout(() => {
+    run.stabilizationTimer = startTimer(() => {
       run.stabilizationTimer = undefined;
       void probe(run.taskID, run.generation);
     }, stabilizationProbeDelayMs);
-    run.stabilizationTimer.unref?.();
+    run.stabilizationTimer?.unref?.();
   }
 
   function register(input: {
@@ -381,8 +488,9 @@ export function createRevivedRunTracker(options: {
     description: string;
   }): void {
     const old = runs.get(input.taskID);
-    if (old?.notification.retryTimer) clearTimeout(old.notification.retryTimer);
-    if (old?.stabilizationTimer) clearTimeout(old.stabilizationTimer);
+    if (old?.notification.retryTimer) clearTimer(old.notification.retryTimer);
+    if (old?.notification.deferTimer) clearTimer(old.notification.deferTimer);
+    if (old?.stabilizationTimer) clearTimer(old.stabilizationTimer);
     runs.set(input.taskID, {
       ...input,
       notification: { attempts: 0, sent: false, pending: false },
@@ -393,8 +501,9 @@ export function createRevivedRunTracker(options: {
 
   function discardRun(run: RevivedRun): void {
     if (runs.get(run.taskID) !== run) return;
-    if (run.notification.retryTimer) clearTimeout(run.notification.retryTimer);
-    if (run.stabilizationTimer) clearTimeout(run.stabilizationTimer);
+    if (run.notification.retryTimer) clearTimer(run.notification.retryTimer);
+    if (run.notification.deferTimer) clearTimer(run.notification.deferTimer);
+    if (run.stabilizationTimer) clearTimer(run.stabilizationTimer);
     runs.delete(run.taskID);
   }
 
@@ -404,6 +513,7 @@ export function createRevivedRunTracker(options: {
     isTracked,
     probe,
     onTerminal,
+    holdNotification,
     dispose,
   };
 }
@@ -472,13 +582,18 @@ class NotificationTransportTimeoutError extends Error {
  *     lands as an aborted `error` record. "Background task failed: Session
  *     error" invites the orchestrator to diagnose and retry a task the human
  *     deliberately ended;
- *   - ESC on the orchestrator, whose abort cascades to every lane. Same
- *     wording problem, N times over, for deaths that share one cause and one
- *     one-command recovery.
+ *   - an abort of the orchestrator, which cascades to every lane — ESC, or the
+ *     plugin's own model failover.
  *
- * Both are LABELS on the record (`cancelledByUser`, `killedByCascade`): the
- * state stays whatever the lifecycle recorded, so this only changes what the
- * parent reads, never what the board considers finished.
+ * The second one is not handled here: `notifyParent` sends no prompt at all
+ * for a cascade lane, because one abort produces N of them and the board
+ * already renders the group in a turn the orchestrator was taking anyway. So
+ * the only label this pair has to render is the user's own stop, which is a
+ * DECISION the orchestrator must not sit on until its next turn.
+ *
+ * `cancelledByUser` is a LABEL on the record: the state stays whatever the
+ * lifecycle recorded, so this only changes what the parent reads, never what
+ * the board considers finished.
  */
 function terminalSummary(
   description: string,
@@ -490,9 +605,6 @@ function terminalSummary(
   if (stop) {
     const reason = stop.reason ? ` (${stop.reason})` : '';
     return `Background task stopped by the user (omos lanes stop): ${description}${reason}`;
-  }
-  if (record.killedByCascade) {
-    return `Background task interrupted by ESC on the orchestrator: ${description}`;
   }
   return `Background task failed: ${description}`;
 }
@@ -512,12 +624,6 @@ function terminalBody(
       `The user stopped this lane from a second terminal${
         stop.reason ? `: ${stop.reason}` : ''
       }. Treat it as a cancellation - do not relaunch it unasked; its session is intact, so task_revive(task_id) resumes it if the user asks.`,
-      recorded,
-    ];
-  }
-  if (record.killedByCascade) {
-    return [
-      'This lane was interrupted by ESC on the orchestrator, which aborts every lane at once. It did not fail: its session is intact and task_revive(task_id) resumes it in place.',
       recorded,
     ];
   }

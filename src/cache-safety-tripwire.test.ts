@@ -76,7 +76,11 @@ const ALLOWLIST = new Map<string, string>([
   ],
   [
     'hooks/task-session-manager/cascade-attribution.ts',
-    'Date.now() is the cascade clock: it decides WHICH lanes belong to one ESC (the 3s window), when an auto-revive fires, and the per-lane cooldown. The one value that lands on a record is killedByCascade.at, and background-job-board.ts renders that stamp as fixed text plus the alias \u2014 never the timestamp, never an age \u2014 so two renders of an unchanged cascade are byte-identical.',
+    'Date.now() is the cascade clock: it decides WHICH lanes belong to one abort of the orchestrator (the 3s window), when an auto-revive fires, and the per-lane cooldown. The one value that lands on a record is killedByCascade.at, and background-job-board.ts renders that stamp as fixed text plus the alias \u2014 never the timestamp, never an age \u2014 so two renders of an unchanged cascade are byte-identical.',
+  ],
+  [
+    'hooks/task-session-manager/revived-run-tracker.ts',
+    'Date.now() is the default clock for ONE decision: how long a revived lane\u2019s parent notification is held after an abort, so it renders after the cause of that abort is known instead of ~100ms before it. The delay is compared against holdUntil and never serialized \u2014 the notification text is built from the record\u2019s description and resultSummary only \u2014 and the notification is a session prompt, not part of the injected board, so it is not a cached-prefix input at all.',
   ],
   [
     'hooks/image-hook.ts',

@@ -868,6 +868,31 @@ export async function runLanesStop(
     });
   }
 
+  // The mirror said `running` and the server says idle. The overwhelmingly
+  // common cause is that the lane died a moment ago — one orchestrator abort kills
+  // every lane at once — and the plugin's mirror flush is debounced to at most
+  // one write per second, so the file is simply a beat behind. Re-read it once
+  // (a single sync read, no sleep): if it has caught up, this is the
+  // "already stopped" case above and the cancel is RECORDED rather than
+  // refused, which is what the user asked for.
+  if (lane && !active && before === 'idle' && !isRetainedStopped(lane)) {
+    const fresh = loadLaneBoard(directory, deps.boardFile).lanes.find(
+      (entry) => entry.sessionID === sessionID,
+    );
+    if (fresh && isRetainedStopped(fresh)) {
+      return reportAlreadyStopped({
+        lane: fresh,
+        sessionID,
+        serverUrl,
+        status: before,
+        reason,
+        json,
+        directory,
+        deps,
+      });
+    }
+  }
+
   if (!force && !active) {
     if (json) {
       deps.out(
@@ -897,6 +922,19 @@ export async function runLanesStop(
         ? 'There is nothing to stop: it already finished, or it belongs to a different server.'
         : 'Its status could not be read, so aborting could hit the wrong server.',
     );
+    if (before === 'idle' && lane?.state === 'running') {
+      // The one case with a better answer than "use --force": the lane died
+      // between the mirror's last write and now, so a second attempt records
+      // the cancellation properly instead of aborting a dead session.
+      deps.err(
+        'The mirror still lists it as running, so it may have died a moment ago',
+      );
+      deps.err(
+        '(one abort of the orchestrator kills every lane): retry in a second and',
+      );
+      deps.err('this will be recorded as your cancellation instead.');
+      return 1;
+    }
     deps.err(
       'Check "omos lanes list" / "omos lanes show", pass --server, or use --force.',
     );
@@ -1413,10 +1451,10 @@ interface ReviveOutcome {
  * The outcome a settled record carries, seeing through `reconciled`.
  *
  * `reconciled` means "the orchestrator has been told", not a different fate:
- * an ESC-killed lane is `error` + unreconciled at first and becomes
+ * a cascade-killed lane is `error` + unreconciled at first and becomes
  * `reconciled` with `terminalState: 'error'` the moment the parent takes a
  * turn. Treating those as two different things would make `revive --cascade`
- * silently stop working a minute after the ESC.
+ * silently stop working a minute after the abort.
  */
 function terminalOutcomeOf(lane: LaneMirrorRecord): string {
   return lane.state === 'reconciled'
@@ -1485,7 +1523,7 @@ function isBulkRevivable(lane: LaneMirrorRecord): boolean {
  *
  * Grouped by exact `killedByCascade.at`, which the plugin sets to one shared
  * confirmation instant per cascade. Older cascades are deliberately excluded:
- * `--cascade` means "undo the ESC I just pressed", not "restart everything
+ * `--cascade` means "undo the abort that just happened", not "restart everything
  * that has ever been interrupted here" (that is `--all`).
  */
 function selectLatestCascade(lanes: LaneMirrorRecord[]): LaneMirrorRecord[] {
@@ -1588,7 +1626,7 @@ export async function runLanesRevive(
 
     if (selected.length === 0) {
       const scope = cascade
-        ? 'lanes interrupted by an ESC on the orchestrator'
+        ? 'lanes interrupted by an abort of the orchestrator'
         : 'interrupted lanes';
       if (json) {
         deps.out(
@@ -1603,7 +1641,7 @@ export async function runLanesRevive(
       deps.out(`No ${scope} to revive in ${directory}.`);
       if (cascade && board.lanes.some(isBulkRevivable)) {
         deps.out(
-          'There are interrupted lanes, but none is attributed to an ESC cascade.',
+          'There are interrupted lanes, but none is attributed to an orchestrator abort.',
         );
         deps.out('Revive one by name, or use --all.');
       }

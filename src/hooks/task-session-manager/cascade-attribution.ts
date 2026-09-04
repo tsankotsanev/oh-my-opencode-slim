@@ -1,16 +1,26 @@
 /**
- * ESC on the orchestrator: attributing the deaths, and optionally undoing them.
+ * An abort of the orchestrator: attributing the deaths, and optionally undoing
+ * them.
  *
  * ## The problem
  *
  * `session.abort` on a parent kills the **whole session tree**, from a busy
  * parent *and* from an idle one (`docs/agents/subagent-probe-results.md`,
  * probes B1/B3). The plugin cannot prevent that — it observes events, it does
- * not own the abort — so ESC in the TUI always takes every background lane
- * with it. Each of those deaths already lands as an `error` record whose
- * session is intact and revivable in place. What is missing is the *cause*: an
- * abort event carries none, so "the user pressed ESC" and "something aborted
- * this one lane" arrive as byte-identical events.
+ * not own the abort — so an abort of the orchestrator always takes every
+ * background lane with it. Each of those deaths already lands as an `error`
+ * record whose session is intact and revivable in place. What is missing is
+ * the *cause*: an abort event carries none, so "the user pressed ESC" and
+ * "something aborted this one lane" arrive as byte-identical events.
+ *
+ * Two things abort an orchestrator, and only one of them is a person:
+ *
+ * - **ESC** in the TUI ({@link CascadeCause} `'esc'`);
+ * - **the plugin's own foreground fallback** (`'fallback'`), which aborts the
+ *   orchestrator and re-prompts it on a fallback model to recover from a
+ *   rate-limit or auth failure. The parent survives; every lane it owned does
+ *   not. Nobody asked for that, which is why the cause travels on the stamp
+ *   instead of the wording assuming a keypress.
  *
  * Without the attribution the board shows N independent anonymous failures,
  * and the orchestrator's cheapest-looking next move is to relaunch N tasks
@@ -27,7 +37,10 @@
  *   behind it becomes a **candidate**;
  * - a subsequent orchestrator abort **confirms** every candidate recorded in
  *   the last {@link CASCADE_WINDOW_MS} and opens a forward window, so children
- *   whose events arrive after the parent's are tagged too.
+ *   whose events arrive after the parent's are tagged too. This is also the
+ *   only path that can observe a cause: a `'fallback'` abort always produces
+ *   the parent's own `session.error`, so the idle rules below are `'esc'` by
+ *   construction.
  *
  * The idle-parent case (B3) has no parent `session.error` at all — the parent
  * only emits `session.status{idle}` + `session.idle`, and it emits that idle
@@ -69,23 +82,31 @@
  * window closes plus {@link AUTO_REVIVE_DELAY_MS}, through the same
  * `task_revive` machinery the orchestrator uses (`revive-run.ts`), so the
  * parent still gets its synthesized `<task>` notification when the resumed run
- * ends. Four gestures keep ESC a working panic button in that mode:
+ * ends. Three gestures keep that mode survivable, and the honest list is
+ * shorter than it looks:
  *
- * - the delay itself, so `omos lanes stop` can still land first — and because
- *   the lanes are already dead and idle by then, `stop` records the cancel
- *   instead of aborting, which this module CLAIMS immediately before
- *   prompting;
- * - a second orchestrator abort that opens a NEW cascade (i.e. arrives after
- *   the first window closed, which after the first ESC it always does — every
- *   lane is dead by then, so the new cascade has zero candidates) cancels the
- *   pending revive outright. Pressing ESC twice means it. A repeat abort
- *   *inside* one window is only a re-confirmation of that same cascade and
- *   deliberately does not cancel its own revive;
- * - a per-lane {@link AUTO_REVIVE_COOLDOWN_MS} cooldown, which closes the
- *   ESC → revive → ESC → revive loop that cancelling timers alone cannot: a
- *   re-killed lane belongs to a NEW cascade with a new ledger;
- * - one live status read immediately before prompting, so a lane that is busy
- *   (already revived by hand, or running on another server) is never touched.
+ * - **the delay itself**, so `omos lanes stop` can still land first — and
+ *   because the lanes are already dead and idle by then, `stop` records the
+ *   cancel instead of aborting, which this module CLAIMS immediately before
+ *   prompting. This is the gesture that always works.
+ * - **a per-lane {@link AUTO_REVIVE_COOLDOWN_MS} cooldown**, which closes the
+ *   kill → revive → kill → revive loop that cancelling timers alone cannot: a
+ *   re-killed lane belongs to a NEW cascade with a new ledger, so only a
+ *   board-backed stamp can rate-limit it.
+ * - **one live status read** immediately before prompting, so a lane that is
+ *   busy (already revived by hand, or running on another server) is never
+ *   touched.
+ *
+ * A second orchestrator abort cancels the pending revives of earlier cascades
+ * ({@link cancelSupersededAutoRevives}) — but ONLY when that abort is
+ * observable, and after the first cascade it usually is not. The first abort
+ * leaves the parent idle, and aborting an idle session emits no
+ * `session.error` at all (probe B3): the host sends only `session.status{idle}`
+ * + `session.idle`, and with every lane already dead there are no candidates,
+ * so `noteOrchestratorIdle` returns before it can confirm or cancel anything.
+ * So "press ESC twice" is a real gesture only while the orchestrator is still
+ * busy. When it is idle, the working gesture is `omos lanes stop` inside the
+ * delay.
  *
  * None of these is as unambiguous as simply not restarting anything, which is
  * why the default is `off` and the config marks `auto` EXPERIMENTAL.
@@ -93,9 +114,11 @@
 
 import type {
   BackgroundJobRecord,
+  CascadeCause,
   CascadeStamp,
 } from '../../utils/background-job-board';
 import type { BackgroundJobStore } from '../../utils/background-job-store';
+import { canonicalDirectory } from '../../utils/lane-mirror';
 import { isReviveableRetainedJob } from '../../utils/lane-state';
 import { log } from '../../utils/logger';
 import type { RuntimeSessionStatusSnapshot } from '../../utils/session-runtime-status';
@@ -184,10 +207,12 @@ export interface CascadeTracker {
   /**
    * The orchestrator itself was aborted (probe B1) — confirms a cascade.
    *
-   * A second call outside the first window is a second ESC, which CANCELS any
-   * auto-revive still pending for that parent.
+   * `cause` is the caller's reading of WHY: `'fallback'` when the plugin's own
+   * foreground fallback has an abort in flight for this session, `'esc'`
+   * otherwise. A second call outside the first window is a second abort, which
+   * CANCELS any auto-revive still pending for that parent.
    */
-  noteOrchestratorAbort(parentSessionID: string): void;
+  noteOrchestratorAbort(parentSessionID: string, cause: CascadeCause): void;
   /** A managed orchestrator started a turn. Feeds the B3/B2 discriminator. */
   noteOrchestratorBusy(parentSessionID: string): void;
   /**
@@ -245,8 +270,8 @@ export function createCascadeTracker(
 
   /** Anonymous child aborts awaiting confirmation, per parent. */
   const candidates = new Map<string, Candidate[]>();
-  /** Confirmed cascades: parent → shared cascade `at`. */
-  const windows = new Map<string, number>();
+  /** Confirmed cascades: parent → the shared stamp every member gets. */
+  const windows = new Map<string, { at: number; cause: CascadeCause }>();
   /**
    * Busy/idle history of MANAGED orchestrators only.
    *
@@ -289,8 +314,8 @@ export function createCascadeTracker(
 
   /** Drop windows and candidates that can no longer match anything. */
   function sweep(at: number): void {
-    for (const [parent, openedAt] of windows) {
-      if (at - openedAt > windowMs) windows.delete(parent);
+    for (const [parent, open] of windows) {
+      if (at - open.at > windowMs) windows.delete(parent);
     }
     for (const [parent, pending] of candidates) {
       const fresh = pending.filter((entry) => at - entry.at <= windowMs);
@@ -330,36 +355,46 @@ export function createCascadeTracker(
       alias: updated.alias,
       parentSessionID: stamp.parentSessionID,
       cascadeAt: stamp.at,
+      cause: stamp.cause,
     });
   }
 
   /**
    * Open (or extend) a cascade for `parentSessionID` and tag its candidates.
    *
-   * An already-open, still-fresh window keeps its original `at`: every lane of
-   * one cascade must share it, or grouping and `--cascade` selection would
-   * split the same ESC into two.
+   * An already-open, still-fresh window keeps its original `at` AND its
+   * original cause: every lane of one cascade must share the stamp, or
+   * grouping and `--cascade` selection would split one abort into two.
+   *
+   * `cause` is only ever supplied by the `parent-abort` trigger. The idle
+   * triggers cannot observe one and pass `'esc'`, which is correct rather than
+   * a default: a fallback abort is always accompanied by the parent's own
+   * `session.error`, so an idle-only confirmation is a keypress by
+   * construction.
    */
-  function confirm(parentSessionID: string, trigger: ConfirmTrigger): void {
+  function confirm(
+    parentSessionID: string,
+    trigger: ConfirmTrigger,
+    cause: CascadeCause,
+  ): void {
     if (disposed) return;
     const at = now();
     sweep(at);
 
     const pending = candidates.get(parentSessionID) ?? [];
-    const openedAt = windows.get(parentSessionID);
-    const alreadyOpen = openedAt !== undefined;
-    if (!alreadyOpen && !shouldConfirm(trigger, pending)) return;
+    const open = windows.get(parentSessionID);
+    if (open === undefined && !shouldConfirm(trigger, pending)) return;
 
-    const cascadeAt = alreadyOpen ? (openedAt as number) : at;
-    windows.set(parentSessionID, cascadeAt);
+    const stamp = open ?? { at, cause };
+    windows.set(parentSessionID, stamp);
     candidates.delete(parentSessionID);
     for (const candidate of pending) {
-      tag(candidate.taskID, { parentSessionID, at: cascadeAt });
+      tag(candidate.taskID, { parentSessionID, ...stamp });
     }
     if (trigger === 'parent-abort') {
-      cancelSupersededAutoRevives(parentSessionID, cascadeAt);
+      cancelSupersededAutoRevives(parentSessionID, stamp.at);
     }
-    scheduleAutoRevive(parentSessionID, cascadeAt);
+    scheduleAutoRevive(parentSessionID, stamp.at);
   }
 
   /**
@@ -415,13 +450,24 @@ export function createCascadeTracker(
    * blocked on a permission answer may still have work in flight; and a lane
    * with no recorded agent cannot be prompted at all without rewriting its
    * session to `build` (probe A2).
+   *
+   * The outcome is read THROUGH `reconciled`, exactly as `omos lanes revive`
+   * reads it. `reconciled` means "the orchestrator has been told", not a
+   * different fate: if the parent takes any turn inside the 13s window — which
+   * a user typing a new message right after the interruption makes likely —
+   * every lane of the cascade flips to `reconciled` with
+   * `terminalState: 'error'` and the stamp intact, and a literal `state ===
+   * 'error'` test would silently find nothing to restart.
    */
   function isAutoRevivable(
     job: BackgroundJobRecord,
     cascadeAt: number,
   ): boolean {
+    const interrupted =
+      job.state === 'error' ||
+      (job.state === 'reconciled' && job.terminalState === 'error');
     return (
-      job.state === 'error' &&
+      interrupted &&
       job.killedByCascade?.at === cascadeAt &&
       job.cancelledByUser === undefined &&
       !job.cancellationRequested &&
@@ -578,9 +624,9 @@ export function createCascadeTracker(
       if (job.cancelledByUser !== undefined) return;
       const at = now();
       sweep(at);
-      const openedAt = windows.get(parentSessionID);
-      if (openedAt !== undefined) {
-        tag(taskID, { parentSessionID, at: openedAt });
+      const open = windows.get(parentSessionID);
+      if (open !== undefined) {
+        tag(taskID, { parentSessionID, ...open });
         return;
       }
       const pending = candidates.get(parentSessionID) ?? [];
@@ -599,15 +645,15 @@ export function createCascadeTracker(
       // is the reverse of the B3 ordering.
       const liveness = parents.get(parentSessionID);
       if (liveness && at - liveness.lastIdleAt <= windowMs) {
-        confirm(parentSessionID, 'late-candidate');
+        confirm(parentSessionID, 'late-candidate', 'esc');
       }
     },
 
-    noteOrchestratorAbort(parentSessionID): void {
+    noteOrchestratorAbort(parentSessionID, cause): void {
       if (disposed || !parentSessionID) return;
       // A parent abort is unambiguous evidence, so the window opens even with
       // no candidate yet: the children's events may still be in flight.
-      confirm(parentSessionID, 'parent-abort');
+      confirm(parentSessionID, 'parent-abort', cause);
     },
 
     noteOrchestratorBusy(parentSessionID): void {
@@ -626,7 +672,7 @@ export function createCascadeTracker(
       // Cheapest possible guard: idle fires constantly, and only a parent with
       // pending anonymous child aborts can possibly be mid-cascade.
       if (!candidates.has(parentSessionID)) return;
-      confirm(parentSessionID, 'parent-idle');
+      confirm(parentSessionID, 'parent-idle', 'esc');
     },
 
     async flushAutoRevive(): Promise<void> {
@@ -647,4 +693,55 @@ export function createCascadeTracker(
       parents.clear();
     },
   };
+}
+
+/**
+ * The live cascade tracker per project directory.
+ *
+ * Its own registry rather than a passenger on `claimLaneWriters`, for one
+ * reason: that one is claimed only when `backgroundJobs.laneControl` is on,
+ * and this tracker runs regardless of lane control. A pending auto-revive
+ * outliving the config update that turned `reviveOnCascade` OFF is exactly the
+ * kind of surprise the whole `'off'`-by-default posture exists to prevent, so
+ * the teardown must not depend on an unrelated feature flag.
+ *
+ * Module-level (not per-hook) precisely because the new generation has no
+ * reference to the old one.
+ */
+const cascadeTrackersByDirectory = new Map<string, () => void>();
+
+/**
+ * Dispose the cascade tracker a previous plugin generation left running for
+ * `directory`, and register `dispose` as the current owner.
+ *
+ * Never throws: a failed teardown of a dead generation must not stop the new
+ * one from starting.
+ */
+export function claimCascadeTracker(
+  directory: string,
+  dispose: () => void,
+): void {
+  const key = canonicalDirectory(directory);
+  const previous = cascadeTrackersByDirectory.get(key);
+  cascadeTrackersByDirectory.set(key, dispose);
+  if (!previous) return;
+  try {
+    previous();
+  } catch (error) {
+    log('[task-session-manager] previous cascade tracker teardown failed', {
+      directory: key,
+      error: String(error),
+    });
+  }
+}
+
+/** Forget the current owner for `directory` (called from its own dispose). */
+export function releaseCascadeTracker(
+  directory: string,
+  dispose: () => void,
+): void {
+  const key = canonicalDirectory(directory);
+  if (cascadeTrackersByDirectory.get(key) === dispose) {
+    cascadeTrackersByDirectory.delete(key);
+  }
 }

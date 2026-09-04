@@ -73,7 +73,23 @@ export interface AwaitingPermission {
 }
 
 /**
- * Attribution of a lane's death to one orchestrator abort (ESC).
+ * What aborted the orchestrator, and therefore every lane it owned.
+ *
+ * Two producers, one blast radius:
+ *   - `'esc'` — the user pressed ESC in the TUI;
+ *   - `'fallback'` — the plugin's own foreground-fallback manager aborted the
+ *     orchestrator to re-prompt it on a fallback model (a rate-limit or auth
+ *     failover). The lanes are collateral of a recovery nobody asked for, and
+ *     for a long time this was the more common of the two.
+ *
+ * Carried on the stamp because the recovery is identical but the wording must
+ * not lie: telling the orchestrator "the user pressed ESC" when its own
+ * failover killed the lanes is worse than saying nothing.
+ */
+export type CascadeCause = 'esc' | 'fallback';
+
+/**
+ * Attribution of a lane's death to one abort of the orchestrator.
  *
  * `at` is the confirmation instant SHARED by every lane of one cascade, which
  * is what makes the group addressable (`omos lanes revive --cascade`) and
@@ -82,6 +98,7 @@ export interface AwaitingPermission {
 export interface CascadeStamp {
   parentSessionID: string;
   at: number;
+  cause: CascadeCause;
 }
 
 export interface BackgroundJobRecord {
@@ -154,7 +171,7 @@ export interface BackgroundJobRecord {
    */
   cancelledByUser?: { at: number; reason?: string };
   /**
-   * This lane died to an ESC on the orchestrator, not to anything of its own.
+   * This lane died to an abort of the orchestrator, not to anything of its own.
    *
    * A LABEL on the record the lifecycle already produced (an aborted child is
    * `error`), never a state: attribution can only change the wording and the
@@ -830,7 +847,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
   }
 
   /**
-   * Attribute an already-`error` lane to an orchestrator abort cascade (ESC).
+   * Attribute an already-`error` lane to one abort of the orchestrator.
    *
    * Separate from the terminal transition because the two facts arrive in
    * either order: opencode aborts the CHILD first and the parent ~0.1s later
@@ -839,7 +856,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
    *
    * Every refusal below is deliberate, because this stamp is what makes a lane
    * eligible for the bulk affordances and for automatic revival:
-   * - not `error` — an ESC cascade lands as `error` (the abort's
+   * - not `error` — a cascade lands as `error` (the abort's
    *   `session.error`); anything else was not cut off by that abort;
    * - `deadlineExceededAt` — the wall-clock supervisor aborted this lane on
    *   purpose;
@@ -869,6 +886,7 @@ export class BackgroundJobBoard implements BackgroundJobStore {
       killedByCascade: {
         parentSessionID: cascade.parentSessionID,
         at: cascade.at,
+        cause: cascade.cause,
       },
     };
     this.jobs.set(taskID, updated);
@@ -1801,28 +1819,40 @@ function formatUserStop(job: BackgroundJobRecord): string[] | undefined {
   ];
 }
 
+/** How a cascade cause reads to the orchestrator. */
+export function cascadeCauseLabel(cause: CascadeCause): string {
+  return cause === 'fallback' ? 'model failover' : 'ESC';
+}
+
 /**
- * Why this lane is dead: ESC on the orchestrator, not anything of its own.
+ * Why this lane is dead: an abort of the orchestrator, not anything of its own.
  *
- * The Action is the whole point of the attribution. Without it an ESC cascade
+ * This one line is the whole point of the attribution. Without it a cascade
  * reads as N independent anonymous failures, and the orchestrator's cheapest
  * next move looks like relaunching N tasks from scratch — when every session
  * is intact and resumable in place, for free, from the user's other terminal.
+ *
+ * Deliberately ONE line and not a `Interrupted by:` / `Action:` pair like
+ * `formatUserStop`: both halves would open with the same "interrupted by an
+ * abort of the orchestrator", and with a group summary line above it that
+ * phrase would land three times for one fact.
  *
  * Suppressed once the user has deliberately stopped the lane: `formatUserStop`
  * has already said "do not relaunch it unasked", and that instruction outranks
  * a recovery affordance.
  */
 function formatCascade(job: BackgroundJobRecord): string[] | undefined {
-  if (job.killedByCascade === undefined) return undefined;
-  // Only the record shape an ESC actually produces. Anything else carrying a
-  // stamp got there through a race with a deliberate outcome, and that outcome
-  // is the one worth reading.
+  const cascade = job.killedByCascade;
+  if (cascade === undefined) return undefined;
+  // Only the record shape a cascade actually produces. Anything else carrying
+  // a stamp got there through a race with a deliberate outcome, and that
+  // outcome is the one worth reading.
   if (job.state !== 'error') return undefined;
   if (job.cancelledByUser !== undefined) return undefined;
   return [
-    '  Interrupted by: ESC on the orchestrator (one abort kills every lane)',
-    `  Action: interrupted by ESC on the orchestrator; session intact - resume via task_revive or \`omos lanes revive ${promptSafe(
+    `  Action: interrupted by an abort of the orchestrator (${cascadeCauseLabel(
+      cascade.cause,
+    )}); session intact - resume via task_revive or \`omos lanes revive ${promptSafe(
       job.alias,
     )}\``,
   ];
@@ -1844,6 +1874,11 @@ function formatRevivedByUser(job: BackgroundJobRecord): string | undefined {
  * Single-lane cascades are already fully described by their own Action line,
  * so they get no summary.
  *
+ * It says ONLY what the per-lane Actions cannot: that they share one abort,
+ * and the one command that undoes it. "Session intact" and `task_revive` are
+ * on every member's own line already, and repeating them here was N+1 copies
+ * of one sentence.
+ *
  * Render-pure: no ages, no timestamps, nothing derived from `now`, so an
  * unchanged board renders byte-identically on every injection.
  */
@@ -1862,12 +1897,13 @@ function formatCascadeGroups(jobs: BackgroundJobRecord[]): string[] {
   for (const at of [...groups.keys()].sort((a, b) => a - b)) {
     const bucket = groups.get(at) as BackgroundJobRecord[];
     if (bucket.length < 2) continue;
+    const cause = bucket[0]?.killedByCascade?.cause ?? 'esc';
     lines.push(
-      `- ${bucket.length} lanes were interrupted together by one ESC on the orchestrator (${bucket
+      `- ${bucket
         .map((job) => promptSafe(job.alias))
         .join(
           ', ',
-        )}); every session is intact. Resume them all with \`omos lanes revive --cascade\`, or one at a time with task_revive.`,
+        )} share ONE abort of the orchestrator (${cascadeCauseLabel(cause)}): resume the whole group with \`omos lanes revive --cascade\`.`,
     );
   }
   return lines;

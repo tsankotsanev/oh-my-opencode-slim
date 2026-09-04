@@ -31,7 +31,8 @@ export interface LanesTargetedArgs extends LanesCommonArgs {
 
 /**
  * `revive` is the one command that can address more than one lane, because the
- * event it undoes (one ESC) kills more than one lane. Its selector is
+ * event it undoes (one abort of the orchestrator) kills more than one lane.
+ * Its selector is
  * therefore optional and mutually exclusive with the two bulk scopes.
  */
 export interface LanesReviveArgs extends LanesCommonArgs {
@@ -218,7 +219,8 @@ export function parseLanesArgs(args: string[]): LanesArgs {
 
   const common: LanesCommonArgs = { dir: flags.dir, json: flags.json };
 
-  // The bulk scopes exist because one ESC kills many lanes at once. Nothing
+  // The bulk scopes exist because one orchestrator abort kills many lanes at
+  // once. Nothing
   // else addresses more than one lane, and silently ignoring the flag on a
   // command that aborts or prompts would be the wrong kind of forgiving.
   if ((flags.cascade || flags.all) && subcommand !== 'revive') {
@@ -240,7 +242,7 @@ export function parseLanesArgs(args: string[]): LanesArgs {
       return {
         command: 'error',
         message:
-          '--cascade and --all select different sets; pass exactly one (--cascade = the lanes the last ESC killed)',
+          '--cascade and --all select different sets; pass exactly one (--cascade = the lanes the last orchestrator abort killed)',
       };
     }
     if (target && (flags.cascade || flags.all)) {
@@ -253,7 +255,7 @@ export function parseLanesArgs(args: string[]): LanesArgs {
       return {
         command: 'error',
         message:
-          '"lanes revive" needs a lane alias, --cascade (the lanes the last ESC killed), or --all',
+          '"lanes revive" needs a lane alias, --cascade (the lanes the last orchestrator abort killed), or --all',
       };
     }
     return {
@@ -346,8 +348,8 @@ Commands:
   say    <alias|ses_id> ...  Queue an instruction for a running lane
   revive <alias|ses_id>      Resume a lane an abort left behind, in its own
                              session, with its history intact
-  revive --cascade           Resume every lane the last ESC on the orchestrator
-                             killed (one ESC aborts the whole session tree)
+  revive --cascade           Resume every lane the last abort of the
+                             orchestrator killed (it aborts the whole tree)
   revive --all               Resume every revivable interrupted lane here
 
 Options:
@@ -356,7 +358,8 @@ Options:
                              written by the plugin, or $OMO_OPENCODE_SERVER_URL)
   -n, --count <n>            Messages to print for "show" (default: 20)
   --reason "<text>"          Why you stopped the lane; shown to the orchestrator
-  --cascade                  "revive" only: the lanes the last ESC killed
+  --cascade                  "revive" only: the lanes the last orchestrator
+                             abort killed
   --all                      "revive" only: every revivable interrupted lane
   --force                    Override the safety refusals (see Notes)
   --json                     Machine-readable output
@@ -368,7 +371,7 @@ Examples:
   omos lanes show fix-1 -n 5
   omos lanes stop ora-2 --reason "wrong file set"
   omos lanes say fix-1 "also update the codemap"
-  omos lanes revive --cascade          # undo the ESC you just pressed
+  omos lanes revive --cascade          # undo the abort that killed them all
   omos lanes revive fix-1
 
 Notes:
@@ -387,9 +390,11 @@ Notes:
     lives on another server, and prompting it would start a second concurrent
     turn. The orchestrator is notified when the resumed lane finishes, exactly
     as if it had run task_revive itself.
-  - ESC on the orchestrator aborts every lane it owns (this is OpenCode
-    behaviour the plugin cannot prevent). Those lanes are labelled on the board
-    as interrupted by ESC, and "revive --cascade" resumes that group.
+  - An abort of the orchestrator kills every lane it owns (this is OpenCode
+    behaviour the plugin cannot prevent). Two things cause it: ESC in the TUI,
+    and this plugin's own rate-limit failover, which aborts the orchestrator to
+    re-prompt it on a fallback model. Both are labelled on the board with their
+    cause, and "revive --cascade" resumes that group.
   - A lane you stopped yourself is never included in --cascade or --all; name
     it explicitly to reverse your own decision.
   - These commands refuse, and suggest --force, when the target is not a

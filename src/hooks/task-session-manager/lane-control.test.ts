@@ -9,6 +9,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { BackgroundJobBoard } from '../../utils/background-job-board';
+import { BackgroundJobCoordinator } from '../../utils/background-job-coordinator';
 import {
   appendLaneIntent,
   laneIntentsPath,
@@ -18,8 +19,9 @@ import {
 } from '../../utils/lane-control';
 import { laneMirrorPath, readLaneMirror } from '../../utils/lane-mirror';
 import { SERVER_URL_ENV } from '../../utils/server-url';
-import { handleEvent } from './event-router';
+import { handleEvent, NOTIFICATION_CASCADE_DEFER_MS } from './event-router';
 import { createTaskSessionManagerHook } from './index';
+import { createRevivedRunTracker } from './revived-run-tracker';
 
 const ABORT_ERROR = { name: 'MessageAbortedError', message: 'aborted' };
 
@@ -73,7 +75,11 @@ function createDeps(
     terminalJobsInjectedByParent: new Map(),
     pendingInjectedTerminalJobsByParent: new Map(),
     retainedBoardSnapshots: new Map(),
-    revivedRunTracker: { onTerminal: mock(() => {}), dispose: mock(() => {}) },
+    revivedRunTracker: {
+      onTerminal: mock(() => {}),
+      holdNotification: mock(() => {}),
+      dispose: mock(() => {}),
+    },
     ...(overrides.claimUserStopIntent
       ? { claimUserStopIntent: mock(overrides.claimUserStopIntent) }
       : {}),
@@ -461,6 +467,24 @@ describe('task-session-manager lane-control wiring', () => {
     expect(second.dispose).not.toHaveBeenCalled();
   });
 
+  /**
+   * Attribution and auto-revive do not depend on lane control, so their
+   * teardown must not either. The registry that owns the lane-control writers
+   * is claimed only when `laneControl` is on; hanging the tracker off it left
+   * a pending automatic restart running after a config change in exactly the
+   * configuration where the user has the fewest ways to see it.
+   */
+  test('the cascade tracker is torn down even with lane control off', () => {
+    const first = fakeCascadeTracker();
+    createHook(false, runningBoard(), { cascadeTracker: first });
+
+    const second = fakeCascadeTracker();
+    createHook(false, runningBoard(), { cascadeTracker: second });
+
+    expect(first.dispose).toHaveBeenCalled();
+    expect(second.dispose).not.toHaveBeenCalled();
+  });
+
   test('an event flushes the mirror and publishes the sidecar', async () => {
     const board = runningBoard();
     const hook = createHook(true, board);
@@ -672,6 +696,7 @@ describe('task-session-manager lane-control wiring', () => {
       isTracked: mock(() => true),
       probe: mock(async () => false),
       onTerminal: mock(() => {}),
+      holdNotification: mock(() => {}),
       dispose: mock(() => {}),
     };
     const client = {
@@ -830,7 +855,147 @@ describe('task-session-manager lane-control wiring', () => {
     expect(board.get('child-1')?.killedByCascade).toBeUndefined();
   });
 
-  test('a foreground-fallback abort of the orchestrator is not an ESC', async () => {
+  /**
+   * Foreground fallback aborts the orchestrator to re-prompt it on a fallback
+   * model, and that abort kills every lane exactly as ESC does - for a long
+   * time the more common of the two, and never the user's doing. Attributed,
+   * so the lanes stay recoverable; with its own CAUSE, so nothing tells the
+   * orchestrator a keypress it never made.
+   */
+  /**
+   * M1: the parent notification must not be rendered from the record as it
+   * stood when the abort landed.
+   *
+   * A REAL tracker here, not a fake, and a real board: the whole bug lived in
+   * the seam between them. `updateStatus` publishes the terminal to the
+   * board's outcome listeners SYNCHRONOUSLY (this is how `src/index.ts` wires
+   * the tracker), so the prompt used to go out from inside the child's own
+   * `session.error` - ~100ms before the parent evidence that explains it
+   * (probes B1/B3) - and every lane of one ESC read "failed".
+   */
+  function deferHarness(board: BackgroundJobBoard) {
+    const timers: Array<{ id: number; fn: () => void; delay: number }> = [];
+    let nextTimerID = 1;
+    let clock = 100_000;
+    const prompt = mock(async () => ({}));
+    const client = { session: { promptAsync: prompt, messages: undefined } };
+
+    // The production topology, because the bug lived in it: the coordinator
+    // relays the board's terminal transitions to its outcome listeners, and
+    // `src/index.ts` registers `tracker.onTerminal` as one of them. That relay
+    // runs SYNCHRONOUSLY inside `updateStatus`, so the router's own
+    // `onTerminal(record, { deferMs })` is far too late to stop the prompt -
+    // only the hold armed before the write is.
+    const coordinator = new BackgroundJobCoordinator(board);
+    const tracker = createRevivedRunTracker({
+      input: { directory: projectDir, client } as never,
+      backgroundJobBoard: coordinator,
+      now: () => clock,
+      setTimeoutFn: ((fn: () => void, delay: number) => {
+        const id = nextTimerID++;
+        timers.push({ id, fn, delay });
+        return id;
+      }) as unknown as typeof setTimeout,
+      clearTimeoutFn: ((id: number) => {
+        const index = timers.findIndex((timer) => timer.id === id);
+        if (index >= 0) timers.splice(index, 1);
+      }) as unknown as typeof clearTimeout,
+    });
+    coordinator.addTerminalOutcomeListener((record) => {
+      tracker.onTerminal(record);
+    });
+    const hook = createHook(true, coordinator as never, {
+      client,
+      revivedRunTracker: tracker,
+    });
+
+    tracker.register({
+      taskID: 'child-1',
+      generation: board.get('child-1')?.generation as number,
+      parentSessionID: 'parent-1',
+      description: 'fix the parser',
+    });
+
+    return {
+      hook,
+      prompt,
+      tracker,
+      advance(ms: number) {
+        clock += ms;
+        for (const timer of timers.splice(0, timers.length)) timer.fn();
+      },
+    };
+  }
+
+  test('an ESC cascade sends the parent NO per-lane prompt', async () => {
+    const board = runningBoard();
+    const h = deferHarness(board);
+
+    await h.hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'child-1', error: ABORT_ERROR },
+      },
+    } as never);
+    // Nothing on the wire yet: the cause is still 100ms in the future.
+    expect(h.prompt).not.toHaveBeenCalled();
+
+    await h.hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'parent-1', error: ABORT_ERROR },
+      },
+    } as never);
+    expect(board.get('child-1')?.killedByCascade?.cause).toBe('esc');
+
+    h.advance(NOTIFICATION_CASCADE_DEFER_MS);
+    await Promise.resolve();
+    expect(h.prompt).not.toHaveBeenCalled();
+  });
+
+  test('a genuine child failure is still reported, after the defer', async () => {
+    const board = runningBoard();
+    const h = deferHarness(board);
+
+    await h.hook.event({
+      event: {
+        type: 'session.error',
+        properties: {
+          sessionID: 'child-1',
+          error: { name: 'ProviderError', data: { message: 'boom' } },
+        },
+      },
+    } as never);
+
+    // Not an abort, so no hold was armed: the report goes out immediately.
+    await Promise.resolve();
+    expect(h.prompt).toHaveBeenCalledTimes(1);
+    const body = h.prompt.mock.calls[0]?.[0] as {
+      body?: { parts?: Array<{ text?: string }> };
+    };
+    expect(body?.body?.parts?.[0]?.text).toContain('Background task failed');
+  });
+
+  test('an anonymous abort nobody explains is reported once the defer ends', async () => {
+    const board = runningBoard();
+    const h = deferHarness(board);
+
+    await h.hook.event({
+      event: {
+        type: 'session.error',
+        properties: { sessionID: 'child-1', error: ABORT_ERROR },
+      },
+    } as never);
+    expect(h.prompt).not.toHaveBeenCalled();
+
+    // No parent evidence ever arrives, so the lane stays an unattributed
+    // error - and an unattributed error is a real result the parent needs.
+    h.advance(NOTIFICATION_CASCADE_DEFER_MS);
+    await Promise.resolve();
+    expect(h.prompt).toHaveBeenCalledTimes(1);
+  });
+
+  test('a foreground-fallback abort is attributed, as a failover not an ESC', async () => {
     const board = runningBoard();
     const hook = createTaskSessionManagerHook(
       { directory: projectDir, client: {} } as never,
@@ -841,7 +1006,6 @@ describe('task-session-manager lane-control wiring', () => {
         shouldManageSession: (sessionID: string) => sessionID === 'parent-1',
         laneControl: true,
         runtimeStatusReconcileDelayMs: 10_000_000,
-        // Fallback aborts the session to swap models: that abort is ours.
         isFallbackInProgress: (sessionID: string) => sessionID === 'parent-1',
       },
     );
@@ -859,6 +1023,12 @@ describe('task-session-manager lane-control wiring', () => {
       },
     } as never);
 
-    expect(board.get('child-1')?.killedByCascade).toBeUndefined();
+    expect(board.get('child-1')?.killedByCascade).toMatchObject({
+      parentSessionID: 'parent-1',
+      cause: 'fallback',
+    });
+    expect(board.formatForPrompt('parent-1')).toContain(
+      'interrupted by an abort of the orchestrator (model failover)',
+    );
   });
 });

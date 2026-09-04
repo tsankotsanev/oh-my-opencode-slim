@@ -167,6 +167,7 @@ describe('toLaneMirrorRecord', () => {
     board.markCascade(record.taskID, {
       parentSessionID: 'ses_parent',
       at: 7_000,
+      cause: 'esc',
     });
     const mirrored = toLaneMirrorRecord(
       board.get(record.taskID) as NonNullable<ReturnType<typeof board.get>>,
@@ -176,6 +177,7 @@ describe('toLaneMirrorRecord', () => {
     expect(mirrored.killedByCascade).toEqual({
       parentSessionID: 'ses_parent',
       at: 7_000,
+      cause: 'esc',
     });
   });
 

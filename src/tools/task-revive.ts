@@ -1,5 +1,8 @@
 import { type ToolDefinition, tool } from '@opencode-ai/plugin';
-import { launchRetainedRun } from '../hooks/task-session-manager/revive-run';
+import {
+  launchRetainedRun,
+  RelaunchLeaseUnavailableError,
+} from '../hooks/task-session-manager/revive-run';
 import type { RevivedRunTracker } from '../hooks/task-session-manager/revived-run-tracker';
 import type { BackgroundJobSupervisor } from '../utils/background-job-supervisor';
 import { isReviveableRetainedJob } from '../utils/lane-state';
@@ -131,12 +134,16 @@ export function createTaskReviveTool(
           },
         );
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (message === 'relaunch lease unavailable') {
+        // "Cannot be revived" (try again) vs "revive failed" (something broke)
+        // is a real distinction for the orchestrator, and the lease is the one
+        // transient case. Matched on the TYPE: the previous string comparison
+        // silently reclassified it the moment the message was reworded.
+        if (error instanceof RelaunchLeaseUnavailableError) {
           throw new Error(
             `Task ${requested} cannot be revived: relaunch lease unavailable`,
           );
         }
+        const message = error instanceof Error ? error.message : String(error);
         throw new Error(`Task ${requested} revive failed: ${message}`);
       }
 

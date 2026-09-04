@@ -670,13 +670,13 @@ omos lanes stop ora-2 --reason "wrong file set"
 ```
 
 ```bash
-omos lanes revive --cascade             # resume the lanes the last ESC killed
+omos lanes revive --cascade             # resume the lanes one abort killed
 omos lanes revive fix-1                 # resume one lane in its own session
 ```
 
 Options: `--dir <path>` (project, default cwd), `--server <url>`,
 `-n/--count`, `--reason`, `--cascade`/`--all` (revive only), `--force`,
-`--json`. See [ESC and recovery](#esc-and-recovery) for what `revive` does and
+`--json`. See [ESC, failover, and recovery](#esc-failover-and-recovery) for what `revive` does and
 when it refuses.
 
 **How it finds things.** With `backgroundJobs.laneControl` on (the default) the
@@ -774,7 +774,7 @@ Turning this off (`backgroundJobs.laneControl: false`) stops all three files
 from being written or read; `omos lanes list` then explains that the mirror is
 missing, and orchestration is otherwise unaffected.
 
-### ESC and recovery
+### ESC, failover, and recovery
 
 **What ESC does.** Pressing ESC in the TUI aborts the orchestrator session, and
 OpenCode's abort cascades to the **whole session tree**: every background lane
@@ -783,11 +783,21 @@ an idle one (probes B1/B3 in `docs/agents/subagent-probe-results.md`), it emits
 no `session.deleted`, and the plugin cannot prevent it — it observes events, it
 does not own the abort.
 
+> **The same hazard fires without anyone pressing anything.** A **rate-limit (or
+> auth) failover aborts the orchestrator and kills all background lanes.** When
+> the orchestrator's model rate-limits, this plugin's foreground fallback aborts
+> the session and re-prompts it on a fallback model — that is how the failover
+> works, and the abort cascades to every lane just as ESC does. The parent
+> recovers and carries on; its lanes are already dead. On a heavily rate-limited
+> provider this is the *more common* of the two causes. It is attributed exactly
+> like ESC (the lanes stay intact and revivable) but with its own cause, so
+> nothing tells the orchestrator about a keypress that never happened.
+
 What survives is everything that matters: each lane's **session is intact**, so
 it can be resumed in place with its full history, plan and tool log still in
 context. What is missing from the raw events is the *cause* — an abort carries
-none, so "the user pressed ESC" and "something aborted this one lane" arrive as
-byte-identical events. The plugin reconstructs it.
+none, so "the orchestrator was aborted" and "something aborted this one lane"
+arrive as byte-identical events. The plugin reconstructs it.
 
 **Attribution.** A child abort that nobody asked for becomes a *candidate*; a
 later orchestrator abort or idle confirms the group. The rules, and why each
@@ -796,11 +806,12 @@ threshold exists:
 | Evidence | Attributed? | Why |
 |---|---|---|
 | Orchestrator `session.error(MessageAbortedError)` within 3s of the death (before or after) | **Yes**, even for one lane | Probe B1: the parent's own abort is unambiguous. The children are aborted ~0.1s FIRST, so the window looks backwards as well as forwards |
-| Parent went idle, and it was **already idle** when the lane died | **Yes**, one lane is enough | Probe B3: an idle parent that emits another idle has no other reason to. This is the realistic background topology |
+| …and a foreground fallback had an abort in flight for that parent | **Yes**, with `cause: fallback` | The blast radius is identical, so the recovery must be; only the wording changes |
+| Parent went idle, and it was **already idle** when the lane died | **Yes**, one lane is enough (`cause: esc`) | Probe B3: an idle parent that emits another idle has no other reason to. This is the realistic background topology. A failover always produces the parent's own `session.error`, so an idle-only confirmation is a keypress by construction |
 | Parent was **busy** when the lane died, then went idle | Only with **two or more** sibling deaths in the window | Probe B2: a parent goes idle ~0.7s after an unrelated single-lane abort simply because its own turn ended |
 | Parent liveness never observed | Treated as **busy** (two-lane rule) | Fail closed |
 | Parent idled BEFORE the only death | **No** | That is the reverse of the B3 ordering, and not a cascade at all |
-| The lane had a `omos lanes stop` intent, an orchestrator `task_cancel`, a wall-clock timeout, or a foreground-fallback abort | **Never** | Those deaths are already explained; a fallback abort is the plugin's own |
+| The lane had a `omos lanes stop` intent, an orchestrator `task_cancel`, or a wall-clock timeout | **Never** | Those deaths are already explained, and a label would invite undoing a deliberate decision |
 
 Attribution is a **label on the `error` record** (`killedByCascade`), never a
 new state, and it is dropped if a deliberate cancellation lands afterwards. An
@@ -812,10 +823,19 @@ The board then reads, per lane, and once per group of two or more:
 ```text
 - fix-1 / ses_… / fixer / error, unreconciled
   Objective: fix the parser
-  Interrupted by: ESC on the orchestrator (one abort kills every lane)
-  Action: interrupted by ESC on the orchestrator; session intact - resume via task_revive or `omos lanes revive fix-1`
-- 3 lanes were interrupted together by one ESC on the orchestrator (fix-1, exp-1, ora-1); every session is intact. Resume them all with `omos lanes revive --cascade`, or one at a time with task_revive.
+  Action: interrupted by an abort of the orchestrator (ESC); session intact - resume via task_revive or `omos lanes revive fix-1`
+- fix-1, exp-1, ora-1 share ONE abort of the orchestrator (ESC): resume the whole group with `omos lanes revive --cascade`.
 ```
+
+`(ESC)` reads `(model failover)` when the plugin's own fallback caused it.
+
+**The orchestrator is not prompted per lane.** One abort produces N terminal
+lanes, and waking the parent N times to say "each of these is intact" is the
+cost this label exists to avoid. Cascade lanes are reported through the board
+only — injected into a turn the orchestrator was going to take anyway, at no
+extra token cost, already grouped. A lane **you** stopped is different: that is
+a decision, and it still gets its own notification so the orchestrator does not
+sit on it until its next turn.
 
 > **Known false positive.** Two per-pane ESCs on sibling lanes within three
 > seconds, while their parent happens to finish its turn, produce exactly the
@@ -828,7 +848,7 @@ The board then reads, per lane, and once per group of two or more:
 **Recovering by hand.** From the second terminal, at zero orchestrator turns:
 
 ```bash
-omos lanes revive --cascade        # the lanes the last ESC killed
+omos lanes revive --cascade        # the lanes the last abort killed
 omos lanes revive fix-1            # one lane, by alias
 omos lanes revive --all            # every interrupted lane in this project
 ```
@@ -866,24 +886,36 @@ session still has everything — except for the one thing the lane cannot know:
 "auto"` resumes the attributed lanes by itself, 13 seconds after the cascade,
 through the same machinery. It is **off by default** and marked EXPERIMENTAL,
 because a wrong attribution here restarts work instead of merely mislabelling
-it. Four gestures keep ESC a panic button:
+it. Three gestures reliably stop it:
 
 1. **the delay** — 3s window + 10s grace before anything moves;
 2. **`omos lanes stop`** — after a cascade the lane is already dead and idle, so
    `stop` records the cancellation instead of aborting, and auto-revive claims
    that intent immediately before prompting and skips the lane (labelling it as
-   your cancellation);
-3. **a second ESC** — an orchestrator abort that opens a new cascade cancels the
-   pending restarts of the earlier one. Pressing ESC twice means it;
-4. **a 10-minute per-lane cooldown** — cancelling timers is not enough on its
-   own, because a re-killed lane belongs to a *new* cascade; the cooldown is
-   what closes the ESC → revive → ESC loop. It survives kills and relaunches,
-   and it never applies to an explicit `omos lanes revive`.
+   your cancellation). **This is the gesture that always works**, and the one to
+   reach for inside those 13 seconds;
+3. **a 10-minute per-lane cooldown** — a re-killed lane belongs to a *new*
+   cascade with a new ledger, so cancelling timers cannot close the
+   kill → revive → kill loop; only this board-backed stamp can. It survives
+   kills and relaunches, and it never applies to an explicit
+   `omos lanes revive`.
+
+> **"Just press ESC again" only works while the orchestrator is busy.** A second
+> orchestrator abort does cancel the pending restarts of an earlier cascade —
+> but only if that abort is observable, and after the first cascade it usually
+> is not. The first ESC leaves the parent **idle**, and aborting an idle session
+> emits no `session.error` at all (probe B3): the host sends only
+> `session.status{idle}` + `session.idle`, and with every lane already dead
+> there are no candidates left, so the idle path returns before it can cancel
+> anything. Use `omos lanes stop` (gesture 2) instead; it is recorded even on an
+> already-dead lane, which is exactly what makes it work here.
 
 On top of those, auto-revive takes one live status read and touches only lanes
 that are positively idle, never a lane whose cancellation the orchestrator owns,
 and at most once per lane per cascade — the attempt is stamped *before* the
-prompt, so a restart that never comes back is not retried.
+prompt, so a restart that never comes back is not retried. A lane the
+orchestrator has already been told about (`reconciled`) is still restarted: that
+state means "the parent knows", not a different outcome.
 
 The wake scheduler is deliberately not involved: it wakes an idle orchestrator
 on its own schedule, and gating it on lane state was rejected — recovery here is

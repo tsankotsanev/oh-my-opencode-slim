@@ -24,7 +24,7 @@ import type {
   InjectedTerminalJobs,
   RetainedBoardSnapshotState,
 } from './board-injection';
-import type { CascadeTracker } from './cascade-attribution';
+import { CASCADE_WINDOW_MS, type CascadeTracker } from './cascade-attribution';
 import type {
   EarlyTaskRegistration,
   PendingTaskCall,
@@ -189,6 +189,17 @@ function observeSessionEvent(
     activityFenceOnly,
   };
 }
+
+/**
+ * How long a revived lane's parent notification waits after an abort.
+ *
+ * The cascade window plus a margin: an abort's CAUSE arrives after the abort
+ * itself (the parent's own `session.error` lands ~100ms later, and an idle
+ * confirmation later still), so a notification sent on the abort event is
+ * guaranteed to render before the attribution exists. 300ms of slack covers
+ * the confirming event plus the synchronous `markCascade` behind it.
+ */
+export const NOTIFICATION_CASCADE_DEFER_MS = CASCADE_WINDOW_MS + 300;
 
 /**
  * Events that prove a child session is still producing output.
@@ -804,16 +815,19 @@ export async function handleEvent(
     }
     if (sessionId && deps.options.shouldManageSession(sessionId)) {
       const props = input.event.properties as { error?: unknown } | undefined;
-      // ESC on the orchestrator (probe B1): the parent's own abort is the
-      // unambiguous half of the two-sided cascade detection, and it confirms
-      // candidates recorded up to 3s BEFORE it — the children are aborted
-      // first. Foreground fallback aborts the same way to swap models, so a
-      // fallback in flight is excluded: that abort is ours, not the user's.
-      if (
-        isAbortedSessionError(props?.error) &&
-        !deps.options.isFallbackInProgress?.(sessionId)
-      ) {
-        deps.cascade?.noteOrchestratorAbort(sessionId);
+      // An abort of the orchestrator (probe B1) is the unambiguous half of the
+      // two-sided cascade detection, and it confirms candidates recorded up to
+      // 3s BEFORE it — the children are aborted first.
+      //
+      // Foreground fallback aborts the orchestrator the same way to swap
+      // models, and it kills every lane just as thoroughly, so it is attributed
+      // too — with its own CAUSE, because "the user pressed ESC" would be a
+      // lie about the plugin's own recovery.
+      if (isAbortedSessionError(props?.error)) {
+        deps.cascade?.noteOrchestratorAbort(
+          sessionId,
+          deps.options.isFallbackInProgress?.(sessionId) ? 'fallback' : 'esc',
+        );
       }
       // Only clear injected terminal jobs for fatal errors.
       // Rate-limit errors are recovered by ForegroundFallbackManager
@@ -849,6 +863,16 @@ export async function handleEvent(
           ) {
             return;
           }
+          const aborted = isAbortedSessionError(props?.error);
+          // Armed BEFORE the write: `updateStatus` publishes the terminal to
+          // the board's outcome listeners synchronously, and one of those is
+          // this same tracker (`src/index.ts`). See `holdNotification`.
+          if (aborted) {
+            deps.revivedRunTracker?.holdNotification(
+              sessionId,
+              NOTIFICATION_CASCADE_DEFER_MS,
+            );
+          }
           const updated = deps.backgroundJobBoard.updateStatus({
             taskID: sessionId,
             state: 'error',
@@ -858,7 +882,12 @@ export async function handleEvent(
             // every record ends up saying "Session error".
             resultSummary: sessionErrorMessage(props?.error, 'Session error'),
           });
-          if (updated) deps.revivedRunTracker?.onTerminal(updated);
+          if (updated) {
+            deps.revivedRunTracker?.onTerminal(
+              updated,
+              aborted ? { deferMs: NOTIFICATION_CASCADE_DEFER_MS } : undefined,
+            );
+          }
         }
       } else if (isInlineFailoverError(props.error)) {
         // Recovery possible: defer. The idle backstop terminalizes this
@@ -898,6 +927,20 @@ export async function handleEvent(
         // record IS revivable in place, which is exactly the affordance the
         // orchestrator needs here.
         const transport = isTransportError(props?.error);
+        const childAborted = isAbortedSessionError(props?.error);
+        // The cause of an abort is not knowable yet: the parent's own evidence
+        // is ~100ms behind this event (probes B1/B3), and a user `stop` intent
+        // is claimed two statements below. So a revived lane's parent
+        // notification is held before the write — `updateStatus` publishes the
+        // terminal to the board's outcome listeners synchronously, and one of
+        // those listeners is this same tracker (`src/index.ts`), which would
+        // otherwise put "failed" on the wire from inside this call.
+        if (childAborted) {
+          deps.revivedRunTracker?.holdNotification(
+            sessionId,
+            NOTIFICATION_CASCADE_DEFER_MS,
+          );
+        }
         const updated = deps.backgroundJobBoard.updateStatus({
           taskID: sessionId,
           state: 'error',
@@ -919,7 +962,7 @@ export async function handleEvent(
         // cannot inherit the label; the board itself refuses to overwrite an
         // orchestrator-owned cancellation.
         let terminal = updated;
-        if (updated && isAbortedSessionError(props?.error)) {
+        if (updated && childAborted) {
           const intent = deps.claimUserStopIntent?.(sessionId);
           if (intent) {
             terminal =
@@ -937,12 +980,19 @@ export async function handleEvent(
           } else {
             // Nobody asked for this one. It becomes a cascade CANDIDATE: an
             // orchestrator abort or idle within the window turns it into an
-            // attributed ESC death, and anything else leaves it an anonymous
-            // (but still revivable) error.
+            // attributed cascade death, and anything else leaves it an
+            // anonymous (but still revivable) error.
             deps.cascade?.noteChildAbort(sessionId, updated.parentSessionID);
           }
         }
-        if (terminal) deps.revivedRunTracker?.onTerminal(terminal);
+        if (terminal) {
+          deps.revivedRunTracker?.onTerminal(
+            terminal,
+            childAborted
+              ? { deferMs: NOTIFICATION_CASCADE_DEFER_MS }
+              : undefined,
+          );
+        }
       }
     }
 
