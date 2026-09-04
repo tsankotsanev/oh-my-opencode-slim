@@ -192,7 +192,7 @@ export function createRevivedRunTracker(options: {
     // makes the router's `onTerminal(..., { deferMs })` still work when the
     // board's synchronous outcome listener got there first.
     if (run.notification.deferTimer) {
-      clearTimeout(run.notification.deferTimer);
+      clearTimer(run.notification.deferTimer);
       run.notification.deferTimer = undefined;
       scheduleDeferredNotification(run);
     }
@@ -202,13 +202,13 @@ export function createRevivedRunTracker(options: {
     disposed = true;
     for (const run of runs.values()) {
       if (run.notification.retryTimer) {
-        clearTimeout(run.notification.retryTimer);
+        clearTimer(run.notification.retryTimer);
       }
       if (run.notification.deferTimer) {
-        clearTimeout(run.notification.deferTimer);
+        clearTimer(run.notification.deferTimer);
       }
       if (run.stabilizationTimer) {
-        clearTimeout(run.stabilizationTimer);
+        clearTimer(run.stabilizationTimer);
       }
     }
     runs.clear();
